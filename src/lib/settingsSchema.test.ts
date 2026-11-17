@@ -100,6 +100,14 @@ describe('settings schema', () => {
         'editor.lineNumbers',
         'editor.autoCloseBrackets',
         'execution.defaultRowLimit',
+        'execution.queryTimeoutSecs',
+        'execution.autoCommit',
+        'execution.stopScriptOnError',
+        'execution.confirmDestructive',
+        'connections.connectTimeoutSecs',
+        'connections.keepaliveSecs',
+        'connections.autoReconnect',
+        'connections.sshKnownHosts',
       ].sort(),
     );
   });

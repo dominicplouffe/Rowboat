@@ -1,7 +1,17 @@
 // In-memory stand-in for the Rust core, for browser-only development and
 // tests. Never part of a production bundle (see ipc.ts).
 
-import type { AppInfo, Settings } from './types';
+import type {
+  AppInfo,
+  ConnectionConfig,
+  ConnectionView,
+  DbError,
+  RunResult,
+  SchemaNode,
+  SecretInput,
+  Settings,
+  StatementSpan,
+} from './types';
 
 export function defaultSettings(): Settings {
   return {
@@ -73,6 +83,7 @@ const info: AppInfo = {
   arch: 'n/a',
   defaultClientId: 'rowboat-dev',
   settingsPath: '(in memory)',
+  secretsPersistent: false,
 };
 
 export async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -93,6 +104,178 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
     case 'settings_export':
     case 'settings_import':
       return null as T;
+    default:
+      return fakeDatabase<T>(command, args ?? {});
+  }
+}
+
+// ---- A pretend database, enough to exercise the UI without a server ----
+
+const connections = new Map<string, ConnectionConfig>();
+const withPassword = new Set<string>();
+const open = new Set<string>();
+const cancelled = new Set<string>();
+let nextId = 1;
+
+function fail(kind: DbError['kind'], message: string, extra: Partial<DbError> = {}): DbError {
+  return { kind, message, detail: null, hint: null, code: null, position: null, ...extra };
+}
+
+function view(config: ConnectionConfig): ConnectionView {
+  return {
+    ...config,
+    hasPassword: withPassword.has(config.id),
+    hasSshPassword: false,
+    hasSshPassphrase: false,
+    connected: open.has(config.id),
+    serverVersion: open.has(config.id) ? 'Fake DB 1.0' : null,
+    supportsTransactions: config.kind !== 'clickhouse',
+    inTransaction: false,
+  };
+}
+
+/** Naive splitter for the fake only; the real one is in the Rust core. */
+function split(text: string): StatementSpan[] {
+  const spans: StatementSpan[] = [];
+  let start = 0;
+  for (const part of text.split(';')) {
+    const lead = part.length - part.trimStart().length;
+    const body = part.trim();
+    if (body) spans.push({ start: start + lead, end: start + lead + body.length });
+    start += part.length + 1;
+  }
+  return spans;
+}
+
+const TREE: Record<string, SchemaNode[]> = {
+  '': [{ name: 'public', kind: 'schema', detail: null, hasChildren: true }],
+  public: [{ name: 'Tables', kind: 'group', detail: null, hasChildren: true }],
+  'public/Tables': [
+    { name: 'customers', kind: 'table', detail: '~1.2k rows', hasChildren: true },
+    { name: 'orders', kind: 'table', detail: '~48.0k rows', hasChildren: true },
+  ],
+  'public/Tables/orders': [
+    { name: 'id', kind: 'column', detail: 'integer · primary key', hasChildren: false },
+    { name: 'customer_id', kind: 'column', detail: 'integer · not null', hasChildren: false },
+    { name: 'total', kind: 'column', detail: 'numeric(10,2)', hasChildren: false },
+    { name: 'created_at', kind: 'column', detail: 'timestamp with time zone', hasChildren: false },
+  ],
+  'public/Tables/customers': [
+    { name: 'id', kind: 'column', detail: 'integer · primary key', hasChildren: false },
+    { name: 'name', kind: 'column', detail: 'text · not null', hasChildren: false },
+  ],
+};
+
+async function fakeDatabase<T>(command: string, args: Record<string, unknown>): Promise<T> {
+  switch (command) {
+    case 'connections_list':
+      return [...connections.values()].map(view) as T;
+    case 'connection_save': {
+      const config = structuredClone(args.config as ConnectionConfig);
+      if (!config.name.trim()) throw fail('other', 'Give the connection a name.');
+      if (!config.id) config.id = `fake-${nextId++}`;
+      else open.delete(config.id);
+      connections.set(config.id, config);
+      const password = (args.secrets as SecretInput).password;
+      if (password !== undefined) {
+        if (password) withPassword.add(config.id);
+        else withPassword.delete(config.id);
+      }
+      return view(config) as T;
+    }
+    case 'connection_delete':
+      connections.delete(args.id as string);
+      open.delete(args.id as string);
+      return undefined as T;
+    case 'connection_test': {
+      const config = args.config as ConnectionConfig;
+      if (config.host === 'unreachable') throw fail('connection', 'Connection refused.');
+      return 'Fake DB 1.0' as T;
+    }
+    case 'connection_open': {
+      const config = connections.get(args.id as string);
+      if (!config) throw fail('other', 'That connection no longer exists.');
+      if (config.host === 'unreachable') throw fail('connection', 'Connection refused.');
+      open.add(config.id);
+      return view(config) as T;
+    }
+    case 'connection_close':
+      open.delete(args.connectionId as string);
+      open.delete(args.id as string);
+      return undefined as T;
+    case 'sql_split':
+      return split(args.text as string) as T;
+    case 'query_cancel':
+      cancelled.add(args.queryId as string);
+      return undefined as T;
+    case 'transaction_end':
+    case 'pick_file':
+      return (command === 'pick_file' ? null : undefined) as T;
+    case 'schema_children':
+      return (TREE[(args.path as string[]).join('/')] ?? []) as T;
+    case 'schema_ddl':
+      return `CREATE TABLE ${(args.path as string[]).at(-1)} (\n    id integer PRIMARY KEY\n);` as T;
+    case 'query_run': {
+      const sql = (args.sql as string).trim();
+      const config = connections.get(args.connectionId as string);
+      if (!config || !open.has(config.id)) throw fail('connection', 'This connection is not open.');
+      const lower = sql.toLowerCase();
+      if (
+        config.environment === 'prod' &&
+        /^(drop|truncate|alter)\b/.test(lower) &&
+        !args.confirmed
+      ) {
+        throw fail('needs-confirmation', 'DROP removes objects permanently.');
+      }
+      if (lower.includes('sleep')) {
+        const queryId = args.queryId as string;
+        for (let i = 0; i < 100 && !cancelled.has(queryId); i++) {
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        if (cancelled.delete(queryId)) throw fail('cancelled', 'Query cancelled.');
+      }
+      const typo = lower.indexOf('fromm');
+      if (typo >= 0) {
+        throw fail('syntax', 'syntax error at or near "FROMM"', {
+          code: '42601',
+          position: typo + 1,
+        });
+      }
+      const base: RunResult = {
+        columns: [],
+        rows: [],
+        moreAvailable: false,
+        rowsAffected: null,
+        raw: null,
+        notices: [],
+        inTransaction: false,
+        elapsedMs: 12,
+      };
+      if (!/^(select|with|show|explain|values)\b/.test(lower)) {
+        return { ...base, rowsAffected: 1 } as T;
+      }
+      const limit = (args.rowLimit as number) || 5000;
+      const total = 5000;
+      const count = Math.min(limit, total);
+      return {
+        ...base,
+        columns: [
+          { name: 'id', typeName: 'int4', kind: 'number' },
+          { name: 'name', typeName: 'text', kind: 'text' },
+          { name: 'total', typeName: 'numeric', kind: 'number' },
+          { name: 'note', typeName: 'text', kind: 'text' },
+          { name: 'created_at', typeName: 'timestamptz', kind: 'temporal' },
+        ],
+        rows: Array.from({ length: count }, (_, i) => [
+          String(i + 1),
+          `Customer ${i + 1}`,
+          ((i * 37) % 1000).toFixed(2),
+          i % 7 === 0 ? null : `note ${i}`,
+          `2026-11-${String((i % 28) + 1).padStart(2, '0')} 10:00:00+00`,
+        ]),
+        moreAvailable: count < total,
+      } as T;
+    }
     default:
       throw new Error(`unknown command: ${command}`);
   }

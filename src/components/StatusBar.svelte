@@ -1,10 +1,14 @@
 <script lang="ts">
+  import { connections } from '../lib/connections.svelte';
   import { formatRowLimit } from '../lib/rowLimit';
   import { settings } from '../lib/settings.svelte';
+  import { tabs } from '../lib/tabs.svelte';
   import type { AppInfo } from '../lib/types';
   import { ui } from '../lib/ui.svelte';
 
   let { info }: { info: AppInfo | null } = $props();
+
+  const connection = $derived(connections.byId(tabs.active?.connectionId));
 </script>
 
 <footer class="status">
@@ -19,7 +23,18 @@
       Default limit <strong>{formatRowLimit(settings.value.execution.defaultRowLimit)}</strong>
     </button>
   {/if}
+  {#if connection?.connected && connection.serverVersion}
+    <span class="server">{connection.name} · {connection.serverVersion}</span>
+  {/if}
   <span class="spacer"></span>
+  {#if info && !info.secretsPersistent}
+    <span
+      class="warning"
+      title="No system keychain was found, so passwords cannot be stored. They are kept in memory and forgotten when Rowboat quits."
+    >
+      No keychain: passwords are not saved
+    </span>
+  {/if}
   {#if settings.error}
     <span class="error" role="alert">Could not save settings: {settings.error}</span>
   {/if}
@@ -59,6 +74,13 @@
   }
   .spacer {
     flex: 1;
+  }
+  .server {
+    padding: 0 6px;
+  }
+  .warning {
+    margin-right: 8px;
+    color: var(--danger);
   }
   .error {
     color: var(--danger);
