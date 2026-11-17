@@ -1,0 +1,140 @@
+name: Release
+
+# Pushing a tag like v0.1.0 builds installers for every platform and collects
+# them in a DRAFT GitHub Release for review. Nothing is published automatically.
+#
+# Signing is optional. With no secrets configured the installers are unsigned
+# (macOS gets an ad-hoc signature), which is the plan while the app matures.
+# When these repository secrets exist they are picked up without editing this
+# file:
+#   macOS    APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
+#            APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID
+# Updater signing (TAURI_SIGNING_PRIVATE_KEY…) and Windows code signing are
+# wired up together with auto-update, before the first public release.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-latest
+            target: universal-apple-darwin # Apple Silicon + Intel
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            args: --target universal-apple-darwin
+          - name: Windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc # .msi + NSIS -setup.exe
+            rust-targets: ''
+            args: ''
+          - name: Linux
+            # 22.04 on purpose: its older glibc makes the binaries run on more distributions.
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu # .deb + .rpm + .AppImage
+            rust-targets: ''
+            args: ''
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+        with:
+          rust-targets: ${{ matrix.rust-targets }}
+
+      - name: The tag matches the app version
+        shell: bash
+        run: node scripts/check-version.mjs "$GITHUB_REF_NAME"
+
+      # An empty APPLE_* variable makes the bundler try (and fail) to sign, so
+      # only secrets that actually exist are exported to later steps.
+      - name: Enable macOS signing if its secrets are configured
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          configured=0
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            value="${!name}"
+            if [ -n "$value" ]; then
+              delimiter="EOF_$(openssl rand -hex 8)"
+              { echo "$name<<$delimiter"; echo "$value"; echo "$delimiter"; } >> "$GITHUB_ENV"
+              configured=$((configured + 1))
+            fi
+          done
+          if [ "$configured" -eq 0 ]; then
+            echo "No Apple signing secrets: building with an ad-hoc signature."
+          else
+            echo "$configured of 6 Apple signing secrets found: signing is enabled."
+          fi
+
+      - name: Build installers and attach them to a draft release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Rowboat ${{ github.ref_name }}
+          releaseBody: See the assets below to download and install this version.
+          releaseDraft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          uploadUpdaterJson: false
+          args: ${{ matrix.args }}
+
+      - name: 'Budget: initial JS bundle < 400 KB gzipped'
+        run: npm run budget:bundle
+
+      - name: 'Budget: installer < 20 MB'
+        run: npm run budget:installer
+
+      - name: Keep the .deb for the Arch package job
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: rowboat-deb
+          retention-days: 7
+          if-no-files-found: error
+          path: src-tauri/target/release/bundle/deb/*.deb
+
+  arch:
+    name: Arch Linux (rowboat-sql-bin)
+    needs: build
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: rowboat-deb
+          path: installers
+      # Builds the package with makepkg from the exact .deb in the release,
+      # installs it with pacman, and writes the PKGBUILD (with real checksums)
+      # and .SRCINFO that go to the AUR.
+      - name: Validate packaging/arch/PKGBUILD with makepkg
+        run: bash packaging/arch/validate.sh "$(find installers -name '*.deb' | head -n 1)" arch-out
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rowboat-sql-bin-aur
+          path: arch-out/
+      # Publishing to the AUR happens after the draft release is published (the
+      # PKGBUILD downloads the .deb from it) and needs an SSH-key secret; that
+      # step is added with the first public release.
