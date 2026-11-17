@@ -241,7 +241,7 @@ export const FIELDS: Field[] = [
     key: 'autoCommit',
     kind: 'toggle',
     label: 'Auto-commit by default',
-    help: 'New PostgreSQL and SQLite tabs commit each statement. Turn off to commit or roll back manually.',
+    help: 'How PostgreSQL and SQLite connections start out. Each connection can be switched from its toolbar.',
     keywords: 'transaction commit rollback',
   },
   {

@@ -268,6 +268,15 @@ async fn transaction_end(
 }
 
 #[tauri::command]
+async fn connection_set_auto_commit(
+    manager: State<'_, Manager>,
+    connection_id: String,
+    auto_commit: bool,
+) -> DbResult<()> {
+    manager.set_auto_commit(&connection_id, auto_commit).await
+}
+
+#[tauri::command]
 async fn schema_children(
     manager: State<'_, Manager>,
     connection_id: String,
@@ -411,6 +420,7 @@ pub fn run() {
             query_run,
             query_cancel,
             transaction_end,
+            connection_set_auto_commit,
             schema_children,
             schema_ddl,
             sql_split,

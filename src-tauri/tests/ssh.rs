@@ -285,6 +285,26 @@ async fn a_changed_host_key_is_always_refused() {
 }
 
 #[tokio::test]
+async fn an_unreadable_known_hosts_file_is_never_treated_as_unknown_host() {
+    let Some(target) = target() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    // A directory where the file should be: it exists but cannot be read.
+    let known_hosts = dir.path().join("known_hosts");
+    std::fs::create_dir(&known_hosts).unwrap();
+    for policy in [
+        KnownHostsPolicy::AcceptNew,
+        KnownHostsPolicy::Ask,
+        KnownHostsPolicy::Strict,
+    ] {
+        let mut p = params(&target, &known_hosts);
+        p.policy = policy;
+        let error = Tunnel::open(p).await.err().unwrap();
+        assert_eq!(error.kind, ErrorKind::Connection, "{policy:?}: {error:?}");
+        assert!(error.message.contains("cannot be read"), "{error:?}");
+    }
+}
+
+#[tokio::test]
 async fn an_unreachable_target_fails_when_the_tunnel_opens() {
     let Some(target) = target() else { return };
     let dir = tempfile::tempdir().unwrap();

@@ -13,7 +13,7 @@
 //! the settings above; the driver notices the refusal once and from then on
 //! sends none, relying on the client-side cut for the row limit.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -50,6 +50,8 @@ pub struct ChSession {
     session_id: Option<String>,
     version: String,
     settings_level: AtomicU8,
+    /// True once a request in the session has succeeded with `database` set.
+    session_has_database: AtomicBool,
     /// Serializes user statements: a ClickHouse HTTP session allows one at a time.
     gate: tokio::sync::Mutex<()>,
     running: Mutex<Option<String>>,
@@ -211,6 +213,7 @@ impl ChSession {
             session_id: (!c.read_only).then(|| format!("rowboat-{}", uuid::Uuid::new_v4())),
             version: String::new(),
             settings_level: AtomicU8::new(SETTINGS_ALL),
+            session_has_database: AtomicBool::new(false),
             gate: tokio::sync::Mutex::new(()),
             running: Mutex::new(None),
             cancelled: Notify::new(),
@@ -244,7 +247,12 @@ impl ChSession {
         {
             let mut query = url.query_pairs_mut();
             query.append_pair("query_id", query_id);
-            if !self.database.is_empty() {
+            // In a session the database is set once; sending it every time
+            // would undo the user's own `USE other_db`.
+            let in_session = stateful && self.session_id.is_some();
+            if !self.database.is_empty()
+                && !(in_session && self.session_has_database.load(Ordering::SeqCst))
+            {
                 query.append_pair("database", &self.database);
             }
             if stateful {
@@ -268,8 +276,9 @@ impl ChSession {
         }
         self.http
             .post(url)
-            .header("X-ClickHouse-User", &self.user)
-            .header("X-ClickHouse-Key", &self.password)
+            // Basic auth is base64, so any UTF-8 user name or password works
+            // (raw header values cannot carry non-ASCII text).
+            .basic_auth(&self.user, Some(&self.password))
             // The default output format; a FORMAT clause in the SQL still wins.
             .header("X-ClickHouse-Format", FORMAT)
             .body(sql.to_string())
@@ -284,12 +293,26 @@ impl ChSession {
         row_limit: u32,
         stateful: bool,
     ) -> DbResult<QueryResult> {
+        let mut lock_retries = 0;
         loop {
             let level = self.settings_level.load(Ordering::SeqCst);
             match self
                 .run_once(sql, query_id, row_limit, level, stateful)
                 .await
             {
+                Ok(result) => {
+                    if stateful {
+                        self.session_has_database.store(true, Ordering::SeqCst);
+                    }
+                    return Ok(result);
+                }
+                // SESSION_IS_LOCKED: the server is still winding down the
+                // previous statement in this session (one we cut at the row
+                // limit or cancelled). It frees up within moments.
+                Err(error) if error.code.as_deref() == Some("373") && lock_retries < 12 => {
+                    lock_retries += 1;
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
                 Err(error) if error.code.as_deref() == Some("164") && level < SETTINGS_NONE => {
                     // "Cannot modify setting in readonly mode": not a failure of
                     // the user's statement, unless it fails again without them.
@@ -851,9 +874,11 @@ mod tests {
         // Client ID as the client name, and as log_comment.
         assert_eq!(request.headers["user-agent"], "rowboat-dominic");
         assert_eq!(request.params["log_comment"], "rowboat-dominic");
-        // Credentials travel in headers, never in the URL.
-        assert_eq!(request.headers["x-clickhouse-user"], "reader");
-        assert_eq!(request.headers["x-clickhouse-key"], "s3cret");
+        // Credentials travel in the Authorization header, never in the URL.
+        assert_eq!(
+            request.headers["authorization"],
+            "Basic cmVhZGVyOnMzY3JldA=="
+        ); // reader:s3cret
         assert!(!request.params.values().any(|v| v.contains("s3cret")));
         // Binary rows, compression, and the fetch-time row limit.
         assert_eq!(request.headers["x-clickhouse-format"], FORMAT);
@@ -864,6 +889,71 @@ mod tests {
         assert_eq!(request.params["database"], "analytics");
         assert!(request.params.contains_key("session_id"));
         assert!(!request.params.contains_key("readonly"));
+    }
+
+    #[tokio::test]
+    async fn passwords_with_any_characters_can_connect() {
+        let server = serve(|_| Reply::Rows(numbers(1))).await;
+        let mut p = params(server.port);
+        p.password = Some("pässwörd-密码".into());
+        let session = ChSession::connect(p).await.expect("non-ASCII password");
+        session
+            .execute("SELECT 1", ExecOptions { row_limit: 0 })
+            .await
+            .unwrap();
+        // base64("reader:pässwörd-密码")
+        assert_eq!(
+            server.user_queries()[0].headers["authorization"],
+            "Basic cmVhZGVyOnDDpHNzd8O2cmQt5a+G56CB"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_database_is_set_once_so_use_keeps_working() {
+        let server = serve(|_| Reply::Rows(numbers(1))).await;
+        let session = ChSession::connect(params(server.port)).await.unwrap();
+        let all = ExecOptions { row_limit: 0 };
+        session.execute("SELECT 1", all).await.unwrap();
+        session.execute("USE other_db", all).await.unwrap();
+        session.execute("SELECT 2", all).await.unwrap();
+
+        let queries = server.user_queries();
+        assert_eq!(
+            queries[0].params.get("database").map(String::as_str),
+            Some("analytics")
+        );
+        // Later statements in the session must not reset the database.
+        assert!(!queries[1].params.contains_key("database"));
+        assert!(!queries[2].params.contains_key("database"));
+        assert_eq!(
+            queries[2].params["session_id"],
+            queries[0].params["session_id"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_briefly_locked_session_is_retried() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
+        let server = serve(move |_| {
+            if seen.fetch_add(1, Ordering::SeqCst) < 2 {
+                Reply::Fail(
+                    500,
+                    "373",
+                    "Code: 373. DB::Exception: Session rowboat-x is locked by a concurrent client. (SESSION_IS_LOCKED)",
+                )
+            } else {
+                Reply::Rows(numbers(3))
+            }
+        })
+        .await;
+        let session = ChSession::connect(params(server.port)).await.unwrap();
+        let result = session
+            .execute("SELECT 1", ExecOptions { row_limit: 0 })
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

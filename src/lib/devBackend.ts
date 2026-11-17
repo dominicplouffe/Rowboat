@@ -115,6 +115,7 @@ const connections = new Map<string, ConnectionConfig>();
 const withPassword = new Set<string>();
 const open = new Set<string>();
 const cancelled = new Set<string>();
+const manualCommit = new Set<string>();
 let nextId = 1;
 
 function fail(kind: DbError['kind'], message: string, extra: Partial<DbError> = {}): DbError {
@@ -131,6 +132,7 @@ function view(config: ConnectionConfig): ConnectionView {
     serverVersion: open.has(config.id) ? 'Fake DB 1.0' : null,
     supportsTransactions: config.kind !== 'clickhouse',
     inTransaction: false,
+    autoCommit: !manualCommit.has(config.id),
   };
 }
 
@@ -208,6 +210,10 @@ async function fakeDatabase<T>(command: string, args: Record<string, unknown>): 
     case 'query_cancel':
       cancelled.add(args.queryId as string);
       return undefined as T;
+    case 'connection_set_auto_commit':
+      if (args.autoCommit) manualCommit.delete(args.connectionId as string);
+      else manualCommit.add(args.connectionId as string);
+      return undefined as T;
     case 'transaction_end':
     case 'pick_file':
       return (command === 'pick_file' ? null : undefined) as T;
@@ -233,6 +239,11 @@ async function fakeDatabase<T>(command: string, args: Record<string, unknown>): 
           await new Promise((r) => setTimeout(r, 50));
         }
         if (cancelled.delete(queryId)) throw fail('cancelled', 'Query cancelled.');
+      }
+      if (lower.includes('lost_connection')) {
+        // The server went away: the core's session is dead from here on.
+        open.delete(config.id);
+        throw fail('connection', 'The connection to the server was lost.');
       }
       const typo = lower.indexOf('fromm');
       if (typo >= 0) {

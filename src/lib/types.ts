@@ -122,6 +122,8 @@ export interface ConnectionView extends ConnectionConfig {
   serverVersion: string | null;
   supportsTransactions: boolean;
   inTransaction: boolean;
+  /** This connection's mode; a new connection starts from the Settings default. */
+  autoCommit: boolean;
 }
 
 /** Secrets typed by the user. Sent to the core once; never returned. */

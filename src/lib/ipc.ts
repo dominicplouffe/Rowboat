@@ -71,6 +71,8 @@ export const ipc = {
     confirmed: boolean;
   }) => call<RunResult>('query_run', args),
   queryCancel: (queryId: string) => call<void>('query_cancel', { queryId }),
+  connectionSetAutoCommit: (connectionId: string, autoCommit: boolean) =>
+    call<void>('connection_set_auto_commit', { connectionId, autoCommit }),
   transactionEnd: (connectionId: string, commit: boolean) =>
     call<void>('transaction_end', { connectionId, commit }),
 

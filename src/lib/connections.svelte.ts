@@ -140,12 +140,24 @@ class Connections {
     if (view) view.inTransaction = inTransaction;
   }
 
-  /** The core lost this connection: reflect that. */
-  markClosed(id: string): void {
+  async setAutoCommit(id: string, autoCommit: boolean): Promise<void> {
+    await ipc.connectionSetAutoCommit(id, autoCommit);
+    const view = this.byId(id);
+    if (view) view.autoCommit = autoCommit;
+  }
+
+  /**
+   * A statement failed because the connection (or its SSH tunnel) is gone.
+   * The dead session is dropped in the core too, so that the next Connect or
+   * Run opens a fresh one instead of reusing it.
+   */
+  async dropDead(id: string): Promise<void> {
+    await ipc.connectionClose(id).catch(() => {});
     const view = this.byId(id);
     if (view) {
       view.connected = false;
       view.inTransaction = false;
+      view.serverVersion = null;
     }
   }
 }

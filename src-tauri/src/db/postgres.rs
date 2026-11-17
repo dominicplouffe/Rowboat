@@ -37,12 +37,7 @@ type Reply<T> = oneshot::Sender<DbResult<T>>;
 
 enum Command {
     Execute(String, ExecOptions, Reply<QueryResult>),
-    /// A catalog query from the navigator: never starts a user transaction.
-    Internal(String, Reply<QueryResult>),
-    EndTransaction {
-        commit: bool,
-        reply: Reply<()>,
-    },
+    EndTransaction { commit: bool, reply: Reply<()> },
     Close,
 }
 
@@ -54,6 +49,15 @@ struct Shared {
 }
 
 impl Shared {
+    fn new(auto_commit: bool) -> Arc<Self> {
+        Arc::new(Self {
+            auto_commit: AtomicBool::new(auto_commit),
+            in_transaction: AtomicBool::new(false),
+            cancel: Mutex::new(None),
+            notices: Mutex::new(Vec::new()),
+        })
+    }
+
     fn take_notices(&self) -> Vec<String> {
         std::mem::take(&mut *self.notices.lock().unwrap_or_else(|e| e.into_inner()))
     }
@@ -63,6 +67,11 @@ pub struct PgSession {
     commands: mpsc::UnboundedSender<Command>,
     shared: Arc<Shared>,
     version: String,
+    params: ConnectParams,
+    /// A second connection for the navigator, opened on first use. Catalog
+    /// queries must never run inside the user's transaction (a failing one
+    /// would abort it) or wait behind the user's long query.
+    catalog: tokio::sync::Mutex<Option<Client>>,
 }
 
 // ------------------------------------------------------------ connecting ----
@@ -319,12 +328,7 @@ async fn open(params: &ConnectParams, shared: &Arc<Shared>) -> DbResult<Client> 
 
 impl PgSession {
     pub async fn connect(params: ConnectParams) -> DbResult<Self> {
-        let shared = Arc::new(Shared {
-            auto_commit: AtomicBool::new(params.auto_commit),
-            in_transaction: AtomicBool::new(false),
-            cancel: Mutex::new(None),
-            notices: Mutex::new(Vec::new()),
-        });
+        let shared = Shared::new(params.auto_commit);
         let client = open(&params, &shared).await?;
         let version = client
             .query_one("SHOW server_version", &[])
@@ -334,11 +338,13 @@ impl PgSession {
         shared.take_notices();
 
         let (commands, inbox) = mpsc::unbounded_channel();
-        tokio::spawn(serve(client, inbox, shared.clone(), params));
+        tokio::spawn(serve(client, inbox, shared.clone(), params.clone()));
         Ok(Self {
             commands,
             shared,
             version,
+            params,
+            catalog: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -352,10 +358,17 @@ impl PgSession {
     }
 
     async fn catalog(&self, sql: String) -> DbResult<Vec<Vec<Option<String>>>> {
-        Ok(self
-            .request(|reply| Command::Internal(sql, reply))
-            .await?
-            .rows)
+        let mut slot = self.catalog.lock().await;
+        if slot.as_ref().is_none_or(Client::is_closed) {
+            // Its own shared state: this connection's cancel token and notices
+            // must not replace the user session's.
+            *slot = Some(open(&self.params, &Shared::new(true)).await?);
+        }
+        let client = slot.as_mut().expect("just opened");
+        run_auto_commit(client, &sql, ExecOptions { row_limit: 0 })
+            .await
+            .map(|result| result.rows)
+            .map_err(map_error)
     }
 }
 
@@ -512,7 +525,7 @@ async fn serve(
                 }
                 Err(error) => {
                     match command {
-                        Command::Execute(_, _, reply) | Command::Internal(_, reply) => {
+                        Command::Execute(_, _, reply) => {
                             let _ = reply.send(Err(error));
                         }
                         Command::EndTransaction { reply, .. } => {
@@ -537,11 +550,6 @@ async fn serve(
             Command::Close => break,
             Command::EndTransaction { reply, .. } => {
                 let _ = reply.send(Ok(()));
-            }
-            Command::Internal(sql, reply) => {
-                let result = run_auto_commit(&mut client, &sql, ExecOptions { row_limit: 0 }).await;
-                shared.take_notices();
-                let _ = reply.send(result.map_err(map_error));
             }
             Command::Execute(sql, options, reply) => {
                 if is_stream_copy(&sql) {
@@ -583,6 +591,32 @@ async fn serve(
     }
 }
 
+/// Ends a transaction, telling the truth about what happened.
+///
+/// PostgreSQL answers `COMMIT` on a transaction in which a statement failed by
+/// rolling it back, without an error. Reporting that as a successful commit
+/// would let the user believe their work was saved, so the state is checked
+/// first.
+async fn end_transaction(tx: Transaction<'_>, commit: bool) -> DbResult<()> {
+    if !commit {
+        return tx.rollback().await.map_err(map_error);
+    }
+    if let Err(error) = tx.batch_execute("SELECT 1").await {
+        let failed =
+            error.code() == Some(&tokio_postgres::error::SqlState::IN_FAILED_SQL_TRANSACTION);
+        let _ = tx.rollback().await;
+        if !failed {
+            return Err(map_error(error));
+        }
+        let mut error = DbError::other(
+            "Nothing was committed. An earlier statement in this transaction failed, so the whole transaction was rolled back.",
+        );
+        error.code = Some("25P02".into());
+        return Err(error);
+    }
+    tx.commit().await.map_err(map_error)
+}
+
 /// Runs the session while a user transaction is open. Returns when it ends.
 async fn in_transaction(
     client: &mut Client,
@@ -618,20 +652,11 @@ async fn in_transaction(
         let current = tx.as_ref().expect("transaction is open");
         match command {
             Command::Close => break,
-            Command::Internal(sql, reply) => {
-                let result = fetch(current, &sql, ExecOptions { row_limit: 0 }).await;
-                shared.take_notices();
-                let _ = reply.send(result.map_err(map_error));
-            }
             Command::EndTransaction { commit, reply } => {
                 let tx = tx.take().expect("transaction is open");
-                let result = if commit {
-                    tx.commit().await
-                } else {
-                    tx.rollback().await
-                };
+                let result = end_transaction(tx, commit).await;
                 shared.take_notices();
-                let _ = reply.send(result.map_err(map_error));
+                let _ = reply.send(result);
                 break;
             }
             Command::Execute(sql, options, reply) => match tx_control(DbKind::Postgres, &sql) {
@@ -643,16 +668,12 @@ async fn in_transaction(
                 }
                 control @ (TxControl::Commit | TxControl::Rollback) => {
                     let tx = tx.take().expect("transaction is open");
-                    let result = if control == TxControl::Commit {
-                        tx.commit().await
-                    } else {
-                        tx.rollback().await
-                    };
-                    let _ = reply.send(finish(
-                        result.map(|()| QueryResult::default()),
-                        shared,
-                        false,
-                    ));
+                    let result = end_transaction(tx, control == TxControl::Commit).await;
+                    let notices = shared.take_notices();
+                    let _ = reply.send(result.map(|()| QueryResult {
+                        notices,
+                        ..Default::default()
+                    }));
                     break;
                 }
                 TxControl::None => {

@@ -154,6 +154,38 @@ describe('running statements', () => {
     expect(connections.byId(bad.id)?.connected).toBe(false);
   });
 
+  it('after the connection is lost, the next run opens a fresh one', async () => {
+    tab.text = 'select lost_connection';
+    await run(tab, cursor(0), 'statement');
+    expect(tab.runs[0].error?.kind).toBe('connection');
+    expect(connections.byId(tab.connectionId)?.connected).toBe(false);
+
+    tab.text = 'select 1';
+    await run(tab, cursor(0), 'statement');
+    expect(tab.runs[0].status).toBe('done');
+    expect(connections.byId(tab.connectionId)?.connected).toBe(true);
+  });
+
+  it('auto-commit is switched per connection, not globally', async () => {
+    const other = await connections.save({ ...blankConnection(), name: 'other' }, {});
+    await connections.setAutoCommit(tab.connectionId!, false);
+    await connections.load();
+    expect(connections.byId(tab.connectionId)?.autoCommit).toBe(false);
+    expect(connections.byId(other.id)?.autoCommit).toBe(true);
+    expect(settings.value?.execution.autoCommit).toBe(true);
+    await connections.setAutoCommit(tab.connectionId!, true);
+  });
+
+  it('result rows stay plain arrays instead of reactive proxies', async () => {
+    tab.text = 'select * from big';
+    await run(tab, cursor(0), 'statement');
+    const rows = tab.runs[0].result!.rows;
+    expect(rows[0][0]).toBe('1');
+    // Reading through a Svelte proxy returns a wrapper; a plain array is itself.
+    expect(tab.runs[0].result!.rows).toBe(rows);
+    expect(Object.getPrototypeOf(tab.runs[0].result)).not.toBe(Object.prototype);
+  });
+
   it('generated (DDL) tabs never run', async () => {
     tab.generated = true;
     tab.text = 'drop table users';

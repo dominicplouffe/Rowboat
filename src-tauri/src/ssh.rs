@@ -55,6 +55,11 @@ enum HostKeyIssue {
     Changed {
         line: usize,
     },
+    /// known_hosts exists but could not be read or understood, so whether
+    /// this host is known cannot be decided.
+    Unreadable {
+        reason: String,
+    },
 }
 
 struct Checker {
@@ -70,19 +75,28 @@ impl Checker {
     fn decide(&self, key: &PublicKey) -> bool {
         let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
         let report = |issue| *self.issue.lock().unwrap_or_else(|e| e.into_inner()) = Some(issue);
-        match known_hosts::check_known_hosts_path(
-            &self.host,
-            self.port,
-            key,
-            &self.known_hosts_path,
-        ) {
+        // A missing file simply means no host is known yet.
+        let listed = if self.known_hosts_path.exists() {
+            known_hosts::check_known_hosts_path(&self.host, self.port, key, &self.known_hosts_path)
+        } else {
+            Ok(false)
+        };
+        match listed {
             Ok(true) => true,
             Err(russh::keys::Error::KeyChanged { line }) => {
                 report(HostKeyIssue::Changed { line });
                 false
             }
+            // The file is there but unusable. Treating that as "unknown host"
+            // would let a changed key through under the accept-new policy.
+            Err(error) => {
+                report(HostKeyIssue::Unreadable {
+                    reason: error.to_string(),
+                });
+                false
+            }
             // Not listed (or no known_hosts file yet).
-            Ok(false) | Err(_) => {
+            Ok(false) => {
                 let accept = match self.policy {
                     KnownHostsPolicy::AcceptNew => true,
                     KnownHostsPolicy::Ask => {
@@ -304,6 +318,11 @@ impl Tunnel {
                         "If the server was really reinstalled, remove line {line} of {} and connect again.",
                         params.known_hosts_path.display()
                     )),
+                    Some(HostKeyIssue::Unreadable { reason }) => DbError::connection(format!(
+                        "SSH tunnel: could not check the host key because {} cannot be read: {reason}",
+                        params.known_hosts_path.display()
+                    ))
+                    .with_hint("Fix or remove that file, then connect again."),
                     None => failed(&format!("could not connect to {}:{}", params.ssh.host, params.ssh.port), error),
                 });
             }

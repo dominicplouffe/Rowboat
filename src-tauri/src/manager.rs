@@ -2,6 +2,7 @@
 //! is the layer the IPC commands call.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -51,6 +52,8 @@ pub struct ConnectionView {
     pub server_version: Option<String>,
     pub supports_transactions: bool,
     pub in_transaction: bool,
+    /// This connection's mode; starts from the "Auto-commit by default" setting.
+    pub auto_commit: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,14 +69,28 @@ struct Open {
     /// Kept alive for as long as the session uses it.
     _tunnel: Option<Tunnel>,
     config: ConnectionConfig,
+    /// Statements on one connection run one at a time. Waiting here, rather
+    /// than inside the driver, is what lets a queued statement be cancelled
+    /// without touching the one that is running.
+    turn: tokio::sync::Mutex<()>,
+    auto_commit: AtomicBool,
+}
+
+/// A statement that has been submitted and not yet finished.
+struct Pending {
+    connection_id: String,
+    /// True once it holds the connection's turn and is with the database.
+    executing: bool,
+    cancelled: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
 }
 
 pub struct Manager {
     db: AppDb,
     secrets: Secrets,
     sessions: tokio::sync::Mutex<HashMap<String, Arc<Open>>>,
-    /// Running query id → connection id, for cancel.
-    running: Mutex<HashMap<String, String>>,
+    /// Submitted statements by query id, for cancel.
+    running: Mutex<HashMap<String, Pending>>,
 }
 
 impl Manager {
@@ -104,6 +121,9 @@ impl Manager {
                     o.session.supports_transactions()
                 }),
             in_transaction: open.as_ref().is_some_and(|o| o.session.in_transaction()),
+            auto_commit: open
+                .as_ref()
+                .is_none_or(|o| o.auto_commit.load(Ordering::SeqCst)),
             config,
         }
     }
@@ -211,6 +231,8 @@ impl Manager {
             session,
             _tunnel: tunnel,
             config: config.clone(),
+            turn: tokio::sync::Mutex::new(()),
+            auto_commit: AtomicBool::new(settings.execution.auto_commit),
         })
     }
 
@@ -308,11 +330,36 @@ impl Manager {
             }
         }
 
-        open.session.set_auto_commit(settings.execution.auto_commit);
-        self.running
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(query_id.to_string(), connection_id.to_string());
+        let (cancelled, wake) = {
+            let entry = Pending {
+                connection_id: connection_id.to_string(),
+                executing: false,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                wake: Arc::new(tokio::sync::Notify::new()),
+            };
+            let handles = (entry.cancelled.clone(), entry.wake.clone());
+            self.pending().insert(query_id.to_string(), entry);
+            handles
+        };
+        // Whatever happens below, the statement stops being pending.
+        let _done = Finished(self, query_id);
+
+        // Wait for this connection's turn; a cancel while waiting ends it here,
+        // before anything reaches the database.
+        let _turn = tokio::select! {
+            turn = open.turn.lock() => turn,
+            () = wake.notified() => return Err(DbError::cancelled()),
+        };
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(DbError::cancelled());
+        }
+        if let Some(entry) = self.pending().get_mut(query_id) {
+            entry.executing = true;
+        }
+
+        open.session
+            .set_auto_commit(open.auto_commit.load(Ordering::SeqCst));
+        // The clock starts when the statement starts, not while it queued.
         let started = Instant::now();
         let execution = open.session.execute(sql, ExecOptions { row_limit });
         let timeout = settings.execution.query_timeout_secs;
@@ -331,29 +378,42 @@ impl Manager {
                 }
             }
         };
-        self.running
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(query_id);
         Ok(RunResult {
             result: result?,
             elapsed_ms: started.elapsed().as_millis() as u64,
         })
     }
 
-    /// Cancels a running statement by the id it was started with.
+    fn pending(&self) -> std::sync::MutexGuard<'_, HashMap<String, Pending>> {
+        self.running.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Cancels the statement that was started with `query_id`, and only that
+    /// one: a queued statement is dropped before it runs; a running one is
+    /// cancelled in the database.
     pub async fn cancel(&self, query_id: &str) {
-        let connection = self
-            .running
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(query_id)
-            .cloned();
-        if let Some(connection_id) = connection {
-            if let Ok(open) = self.session(&connection_id).await {
-                open.session.cancel().await;
+        let target = {
+            let pending = self.pending();
+            let Some(entry) = pending.get(query_id) else {
+                return;
+            };
+            if !entry.executing {
+                entry.cancelled.store(true, Ordering::SeqCst);
+                entry.wake.notify_one();
+                return;
             }
+            entry.connection_id.clone()
+        };
+        if let Ok(open) = self.session(&target).await {
+            open.session.cancel().await;
         }
+    }
+
+    /// Switches one open connection between auto-commit and manual commit.
+    pub async fn set_auto_commit(&self, connection_id: &str, auto_commit: bool) -> DbResult<()> {
+        let open = self.session(connection_id).await?;
+        open.auto_commit.store(auto_commit, Ordering::SeqCst);
+        Ok(())
     }
 
     pub async fn end_transaction(&self, connection_id: &str, commit: bool) -> DbResult<()> {
@@ -379,6 +439,15 @@ impl Manager {
 
     pub async fn ddl(&self, connection_id: &str, path: &[String]) -> DbResult<String> {
         self.session(connection_id).await?.session.ddl(path).await
+    }
+}
+
+/// Removes a statement from the pending map when `run` returns, on any path.
+struct Finished<'a>(&'a Manager, &'a str);
+
+impl Drop for Finished<'_> {
+    fn drop(&mut self) {
+        self.0.pending().remove(self.1);
     }
 }
 
@@ -675,29 +744,145 @@ mod tests {
         assert_eq!(task.await.unwrap().unwrap_err().kind, ErrorKind::Cancelled);
     }
 
-    #[tokio::test]
-    async fn the_auto_commit_setting_is_applied_per_statement() {
-        let dir = tempfile::tempdir().unwrap();
-        let m = manager();
-        let mut settings = Settings::default();
+    const ENDLESS: &str =
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT count(*) FROM n";
+
+    async fn opened(
+        m: &Manager,
+        dir: &tempfile::TempDir,
+        name: &str,
+        settings: &Settings,
+    ) -> String {
         let id = m
-            .save(sqlite(&dir, "tx"), SecretInput::default())
+            .save(sqlite(dir, name), SecretInput::default())
             .await
             .unwrap()
             .config
             .id;
-        m.open(&id, &settings, None).await.unwrap();
-        run(&m, &id, "CREATE TABLE t (id INTEGER)", false, &settings)
+        m.open(&id, settings, None).await.unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_queued_statement_leaves_the_running_one_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Arc::new(manager());
+        let id = opened(&m, &dir, "q", &Settings::default()).await;
+
+        // Tab A runs; tab B queues behind it on the same connection.
+        let (a, connection) = (m.clone(), id.clone());
+        let running = tokio::spawn(async move {
+            a.run(
+                &connection,
+                "tab-a",
+                ENDLESS,
+                1000,
+                false,
+                &Settings::default(),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (b, connection) = (m.clone(), id.clone());
+        let queued = tokio::spawn(async move {
+            b.run(
+                &connection,
+                "tab-b",
+                "SELECT 'b ran'",
+                1000,
+                false,
+                &Settings::default(),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Cancelling B ends B at once and never reaches the database.
+        m.cancel("tab-b").await;
+        assert_eq!(
+            queued.await.unwrap().unwrap_err().kind,
+            ErrorKind::Cancelled
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!running.is_finished(), "tab A must still be running");
+
+        m.cancel("tab-a").await;
+        assert_eq!(
+            running.await.unwrap().unwrap_err().kind,
+            ErrorKind::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn the_timeout_counts_from_when_a_statement_starts_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Arc::new(manager());
+        let mut settings = Settings::default();
+        settings.execution.query_timeout_secs = 1;
+        let id = opened(&m, &dir, "t", &settings).await;
+
+        let (a, connection, slow) = (m.clone(), id.clone(), settings.clone());
+        let first =
+            tokio::spawn(async move { a.run(&connection, "a", ENDLESS, 1000, false, &slow).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Queued for ~0.9 s behind the first; it must not time out for waiting.
+        let second = m.run(&id, "b", "SELECT 1", 1000, false, &settings).await;
+        assert_eq!(first.await.unwrap().unwrap_err().kind, ErrorKind::Timeout);
+        assert_eq!(second.unwrap().result.rows[0][0].as_deref(), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn auto_commit_is_per_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = manager();
+        let settings = Settings::default();
+        let id = opened(&m, &dir, "tx", &settings).await;
+        let other = opened(&m, &dir, "other", &settings).await;
+        for connection in [&id, &other] {
+            run(
+                &m,
+                connection,
+                "CREATE TABLE t (id INTEGER)",
+                false,
+                &settings,
+            )
             .await
             .unwrap();
+        }
 
-        settings.execution.auto_commit = false;
+        // Manual commit on one connection…
+        m.set_auto_commit(&id, false).await.unwrap();
         let r = run(&m, &id, "INSERT INTO t VALUES (1)", false, &settings)
             .await
             .unwrap();
         assert!(r.result.in_transaction);
-        assert!(m.list().await.unwrap()[0].in_transaction);
+        // …does not change the other one.
+        let r = run(&m, &other, "INSERT INTO t VALUES (1)", false, &settings)
+            .await
+            .unwrap();
+        assert!(!r.result.in_transaction);
+
+        let views = m.list().await.unwrap();
+        assert!(views[0].in_transaction && !views[0].auto_commit);
+        assert!(!views[1].in_transaction && views[1].auto_commit);
+
         m.end_transaction(&id, false).await.unwrap();
         assert!(!m.list().await.unwrap()[0].in_transaction);
+
+        // New connections start from the "Auto-commit by default" setting.
+        let mut manual_default = Settings::default();
+        manual_default.execution.auto_commit = false;
+        let third = m
+            .save(sqlite(&dir, "third"), SecretInput::default())
+            .await
+            .unwrap()
+            .config
+            .id;
+        assert!(
+            !m.open(&third, &manual_default, None)
+                .await
+                .unwrap()
+                .auto_commit
+        );
     }
 }

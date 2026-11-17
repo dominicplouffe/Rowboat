@@ -460,6 +460,102 @@ async fn typed_begin_and_commit_control_the_transaction() {
 }
 
 #[tokio::test]
+async fn committing_a_failed_transaction_says_nothing_was_committed() {
+    let s = connect().await;
+    let peer = connect().await;
+    let t = table("failed");
+    s.execute(&format!("CREATE TABLE {t} (id int)"), ALL)
+        .await
+        .unwrap();
+
+    for typed in [false, true] {
+        s.execute("BEGIN", ALL).await.unwrap();
+        s.execute(&format!("INSERT INTO {t} VALUES (1)"), ALL)
+            .await
+            .unwrap();
+        s.execute("SELECT * FROM nope", ALL).await.unwrap_err();
+        let error = if typed {
+            s.execute("COMMIT", ALL).await.unwrap_err()
+        } else {
+            s.commit().await.unwrap_err()
+        };
+        assert!(error.message.contains("Nothing was committed"), "{error:?}");
+        assert!(!s.in_transaction(), "the transaction is over either way");
+        assert_eq!(
+            scalar(
+                &peer
+                    .execute(&format!("SELECT count(*) FROM {t}"), ALL)
+                    .await
+                    .unwrap()
+            ),
+            "0"
+        );
+    }
+    // A healthy transaction still commits.
+    s.execute("BEGIN", ALL).await.unwrap();
+    s.execute(&format!("INSERT INTO {t} VALUES (2)"), ALL)
+        .await
+        .unwrap();
+    s.commit().await.unwrap();
+    assert_eq!(
+        scalar(
+            &peer
+                .execute(&format!("SELECT count(*) FROM {t}"), ALL)
+                .await
+                .unwrap()
+        ),
+        "1"
+    );
+    s.execute(&format!("DROP TABLE {t}"), ALL).await.unwrap();
+}
+
+#[tokio::test]
+async fn browsing_the_schema_never_touches_the_open_transaction() {
+    let s = Arc::new(connect().await);
+    let t = table("browse");
+    s.execute(&format!("CREATE TABLE {t} (id int)"), ALL)
+        .await
+        .unwrap();
+    s.execute("BEGIN", ALL).await.unwrap();
+    s.execute(&format!("INSERT INTO {t} VALUES (1)"), ALL)
+        .await
+        .unwrap();
+
+    // A navigator request that fails…
+    let path: Vec<String> = ["public", "Functions", "no_such_function()"]
+        .iter()
+        .map(|p| p.to_string())
+        .collect();
+    s.ddl(&path).await.unwrap_err();
+    // …and ones that succeed leave the transaction usable.
+    assert!(!s.children(&[]).await.unwrap().is_empty());
+    assert_eq!(
+        scalar(
+            &s.execute(&format!("SELECT count(*) FROM {t}"), ALL)
+                .await
+                .unwrap()
+        ),
+        "1"
+    );
+    s.commit().await.unwrap();
+
+    // The navigator also answers while a long statement is running.
+    let runner = s.clone();
+    let slow = tokio::spawn(async move { runner.execute("SELECT pg_sleep(3)", ALL).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let started = Instant::now();
+    assert!(!s.children(&[]).await.unwrap().is_empty());
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    s.cancel().await;
+    let _ = slow.await;
+    s.execute(&format!("DROP TABLE {t}"), ALL).await.unwrap();
+}
+
+#[tokio::test]
 async fn read_only_connections_refuse_writes() {
     let mut p = params();
     p.config.read_only = true;

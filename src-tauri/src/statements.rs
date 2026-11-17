@@ -224,54 +224,114 @@ pub fn tx_control(kind: DbKind, sql: &str) -> TxControl {
     }
 }
 
-/// Why the Prod guard wants a confirmation, or `None` for a statement that is
-/// not destructive: `DROP`, `TRUNCATE`, `ALTER`, and `UPDATE` / `DELETE`
-/// without a `WHERE`.
-pub fn destructive_reason(kind: DbKind, sql: &str) -> Option<&'static str> {
-    let tokens = tokenize(kind, sql)?;
-    let mut depth = 0usize;
-    let mut verb: Option<Keyword> = None;
-    let mut after_with = false;
-    let mut has_where = false;
+/// One statement-shaped scope: the statement itself, or a parenthesised
+/// sub-statement such as the body of a data-modifying CTE.
+#[derive(Default)]
+struct Scope {
+    verb: Option<Keyword>,
+    /// Still skipping a prefix (`WITH …`, `EXPLAIN ANALYZE …`) before the verb.
+    after_with: bool,
+    /// Saw `EXPLAIN`: its option list `(ANALYZE, …)` is not an expression.
+    explaining: bool,
+    has_where: bool,
+    /// Something other than a keyword came first: not a statement.
+    closed: bool,
+}
 
-    for token in &tokens {
-        match &token.token {
-            Token::LParen => depth += 1,
-            Token::RParen => depth = depth.saturating_sub(1),
-            t if depth == 0 => {
-                let Some(kw) = keyword(t) else { continue };
-                match verb {
-                    None if kw == Keyword::WITH => after_with = true,
-                    None if after_with => {
-                        // Skip the CTE list; the main verb follows it.
-                        if matches!(
-                            kw,
-                            Keyword::SELECT
-                                | Keyword::INSERT
-                                | Keyword::UPDATE
-                                | Keyword::DELETE
-                                | Keyword::MERGE
-                        ) {
-                            verb = Some(kw);
-                        }
-                    }
-                    None => verb = Some(kw),
-                    Some(_) if kw == Keyword::WHERE => has_where = true,
-                    Some(_) => {}
+impl Scope {
+    fn observe(&mut self, kw: Keyword, top_level: bool) {
+        match self.verb {
+            Some(_) => {
+                if kw == Keyword::WHERE {
+                    self.has_where = true;
                 }
             }
-            _ => {}
+            None if self.closed => {}
+            None if kw == Keyword::WITH => self.after_with = true,
+            // `EXPLAIN ANALYZE DELETE …` really runs the DELETE.
+            None if top_level
+                && matches!(kw, Keyword::EXPLAIN | Keyword::ANALYZE | Keyword::VERBOSE) =>
+            {
+                self.explaining = true;
+            }
+            None if self.after_with => {
+                // Skip the CTE list; the main verb follows it.
+                if matches!(
+                    kw,
+                    Keyword::SELECT
+                        | Keyword::INSERT
+                        | Keyword::UPDATE
+                        | Keyword::DELETE
+                        | Keyword::MERGE
+                ) {
+                    self.verb = Some(kw);
+                }
+            }
+            // Inside parentheses only UPDATE and DELETE can be statements
+            // (`WITH x AS (DELETE …)`); anything else there is an expression,
+            // a column list, and so on.
+            None if !top_level && !matches!(kw, Keyword::UPDATE | Keyword::DELETE) => {
+                self.closed = true
+            }
+            None => self.verb = Some(kw),
         }
     }
 
-    match verb? {
-        Keyword::DROP => Some("DROP removes objects permanently."),
-        Keyword::TRUNCATE => Some("TRUNCATE deletes every row."),
-        Keyword::ALTER => Some("ALTER changes the structure of live objects."),
-        Keyword::UPDATE if !has_where => Some("UPDATE without WHERE changes every row."),
-        Keyword::DELETE if !has_where => Some("DELETE without WHERE deletes every row."),
-        _ => None,
+    fn reason(&self) -> Option<&'static str> {
+        match self.verb? {
+            Keyword::DROP => Some("DROP removes objects permanently."),
+            Keyword::TRUNCATE => Some("TRUNCATE deletes every row."),
+            Keyword::ALTER => Some("ALTER changes the structure of live objects."),
+            Keyword::UPDATE if !self.has_where => Some("UPDATE without WHERE changes every row."),
+            Keyword::DELETE if !self.has_where => Some("DELETE without WHERE deletes every row."),
+            _ => None,
+        }
     }
+}
+
+/// Why the Prod guard wants a confirmation, or `None` for a statement that is
+/// not destructive: `DROP`, `TRUNCATE`, `ALTER`, and `UPDATE` / `DELETE`
+/// without a `WHERE`. That includes an `UPDATE` / `DELETE` hidden in a CTE
+/// (`WITH x AS (DELETE FROM t RETURNING *) SELECT …`) and one that
+/// `EXPLAIN ANALYZE` would execute.
+pub fn destructive_reason(kind: DbKind, sql: &str) -> Option<&'static str> {
+    let tokens = tokenize(kind, sql)?;
+    // One scope per open parenthesis, innermost last.
+    let mut scopes = vec![Scope::default()];
+    let mut found = None;
+
+    for token in &tokens {
+        match &token.token {
+            Token::EOF => break,
+            t if is_trivia(t) => {}
+            Token::LParen => {
+                // A parenthesis as the first thing in a scope is not a verb.
+                if let Some(scope) = scopes.last_mut() {
+                    if scope.verb.is_none() && !scope.after_with && !scope.explaining {
+                        scope.closed = true;
+                    }
+                }
+                scopes.push(Scope::default());
+            }
+            Token::RParen => {
+                if scopes.len() > 1 {
+                    let scope = scopes.pop().expect("non-empty");
+                    found = found.or(scope.reason());
+                }
+            }
+            t => {
+                let top_level = scopes.len() == 1;
+                let scope = scopes.last_mut().expect("non-empty");
+                match keyword(t) {
+                    Some(kw) => scope.observe(kw, top_level),
+                    None if scope.verb.is_none() && !scope.after_with => scope.closed = true,
+                    None => {}
+                }
+            }
+        }
+    }
+    // The statement's own verb is the most useful reason to show.
+    scopes.first().and_then(Scope::reason).or(found)
 }
 
 #[cfg(test)]
@@ -401,6 +461,12 @@ mod tests {
             "with old as (select id from t where x) delete from t",
             "update t set a = (select b from u where u.id = 1)",
             "alter table t delete where 1", // ClickHouse mutation
+            // Hidden inside a CTE, or executed by EXPLAIN ANALYZE.
+            "with gone as (delete from users returning *) select count(*) from gone",
+            "with a as (select 1), b as (update users set admin = true returning id) select * from b",
+            "explain analyze delete from users",
+            "EXPLAIN (ANALYZE, BUFFERS) UPDATE users SET admin = true",
+            "explain analyze drop table users",
         ] {
             assert!(destructive_reason(Postgres, sql).is_some(), "{sql}");
         }
@@ -418,6 +484,11 @@ mod tests {
             "-- drop table users\nselect 1",
             "create table dropped (truncate int)",
             "explain select 1",
+            "with gone as (delete from users where id = 1 returning *) select * from gone",
+            "explain analyze delete from users where id = 1",
+            "select (select count(*) from t), coalesce(update_count, 0) from stats",
+            "insert into t (id) select id from u on conflict (id) do update set id = excluded.id",
+            "select * from t where id in (select id from deleted)",
         ] {
             assert_eq!(destructive_reason(Postgres, sql), None, "{sql}");
         }

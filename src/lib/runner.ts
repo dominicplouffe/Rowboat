@@ -6,7 +6,7 @@ import { connections } from './connections.svelte';
 import { asDbError, ipc } from './ipc';
 import { settings } from './settings.svelte';
 import type { StatementRun, Tab } from './tabs.svelte';
-import type { StatementSpan } from './types';
+import type { RunResult, StatementSpan } from './types';
 
 export type RunScope = 'statement' | 'script';
 
@@ -34,6 +34,17 @@ export function statementAtCursor(spans: StatementSpan[], cursor: number): State
   const before = [...spans].reverse().find((s) => s.end <= cursor);
   const chosen = before ?? spans[0];
   return chosen ? [chosen] : [];
+}
+
+/**
+ * Results can hold hundreds of thousands of rows. Svelte makes plain objects
+ * and arrays stored in `$state` deeply reactive by wrapping them in proxies,
+ * which would put a proxy between the grid and every cell. An object with its
+ * own class is stored as is, so the rows stay plain arrays.
+ */
+class Result {}
+function unproxied(result: RunResult): RunResult {
+  return Object.assign(new Result(), result) as RunResult;
 }
 
 function newQueryId(): string {
@@ -82,13 +93,15 @@ export async function run(tab: Tab, selection: EditorSelection, scope: RunScope)
       for (;;) {
         tab.queryId = newQueryId();
         try {
-          statement.result = await ipc.queryRun({
-            connectionId: connection.id,
-            queryId: tab.queryId,
-            sql: statement.sql,
-            rowLimit: tab.rowLimit,
-            confirmed,
-          });
+          statement.result = unproxied(
+            await ipc.queryRun({
+              connectionId: connection.id,
+              queryId: tab.queryId,
+              sql: statement.sql,
+              rowLimit: tab.rowLimit,
+              confirmed,
+            }),
+          );
           statement.status = 'done';
           connections.setInTransaction(connection.id, statement.result.inTransaction);
         } catch (e) {
@@ -103,7 +116,7 @@ export async function run(tab: Tab, selection: EditorSelection, scope: RunScope)
           }
           statement.error = error;
           statement.status = 'failed';
-          if (error.kind === 'connection') connections.markClosed(connection.id);
+          if (error.kind === 'connection') await connections.dropDead(connection.id);
         }
         break;
       }

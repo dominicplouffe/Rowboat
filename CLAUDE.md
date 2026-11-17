@@ -112,6 +112,12 @@ written → `Manager::run` applies the Prod guard and the timeout → the driver
 fetches at most the tab's row limit. Errors come back as a `DbError` with a
 `kind`; only `syntax` and `schema` errors will be sent to the AI (M3).
 
+Sessions: statements on one connection run one at a time (`Manager` holds a
+per-connection turn), so a queued statement can be cancelled without touching
+the running one. Auto-commit is per open connection and starts from the
+Settings default. The PostgreSQL navigator uses its own second connection, so
+catalog queries never run inside (or wait behind) the user's transaction.
+
 Driver rules: values leave the driver already rendered as text; the row limit
 is enforced while fetching (portal with a row count / `max_result_rows` and a
 client-side cut / stop stepping); cancel must return within a second.

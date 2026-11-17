@@ -124,15 +124,15 @@
             <button class="btn" disabled={tab.running} onclick={() => finish(false)}
               >Rollback</button
             >
-          {:else if connection?.supportsTransactions && connection.connected && settings.value && !tab.generated}
+          {:else if connection?.supportsTransactions && connection.connected && !tab.generated}
             <label
               class="check"
-              title="Off: statements run in a transaction until you commit or roll back."
+              title="For this connection only. Off: statements run in a transaction until you commit or roll back."
             >
               <input
                 type="checkbox"
-                checked={settings.value.execution.autoCommit}
-                onchange={(e) => settings.set('execution', 'autoCommit', e.currentTarget.checked)}
+                checked={connection.autoCommit}
+                onchange={(e) => connections.setAutoCommit(connection.id, e.currentTarget.checked)}
               />
               Auto-commit
             </label>
