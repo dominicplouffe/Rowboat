@@ -73,7 +73,6 @@ export const FIELDS: Field[] = [
   {
     section: 'general',
     key: 'restoreTabs',
-    arrives: 'M2',
     kind: 'toggle',
     label: 'Restore tabs on start',
     help: 'Reopen the tabs and unsaved text from your last session.',
@@ -82,19 +81,19 @@ export const FIELDS: Field[] = [
   {
     section: 'general',
     key: 'updateChecks',
-    arrives: 'M4',
     kind: 'select',
     label: 'Update checks',
     options: opts(['auto', 'Install automatically'], ['notify', 'Notify me'], ['off', 'Off']),
-    keywords: 'auto-update upgrade',
+    help: 'Rowboat asks GitHub which releases exist and sends nothing else. For now both choices show a notice in the status bar that opens the download page: installing by itself needs signed builds, which are not set up yet. Off makes no request.',
+    keywords: 'auto-update upgrade new version',
   },
   {
     section: 'general',
     key: 'updateChannel',
-    arrives: 'M4',
     kind: 'select',
     label: 'Update channel',
     options: opts(['stable', 'Stable'], ['beta', 'Beta']),
+    help: 'Beta also offers pre-releases.',
     keywords: 'release prerelease',
   },
 
@@ -136,7 +135,6 @@ export const FIELDS: Field[] = [
   {
     section: 'appearance',
     key: 'gridFontFamily',
-    arrives: 'M2',
     kind: 'text',
     label: 'Grid font',
     placeholder: 'System monospace',
@@ -145,7 +143,6 @@ export const FIELDS: Field[] = [
   {
     section: 'appearance',
     key: 'gridFontSize',
-    arrives: 'M2',
     kind: 'number',
     label: 'Grid font size',
     min: 8,
@@ -196,7 +193,6 @@ export const FIELDS: Field[] = [
   {
     section: 'editor',
     key: 'autocomplete',
-    arrives: 'M2',
     kind: 'select',
     label: 'Autocomplete',
     options: opts(['typing', 'As you type'], ['on-demand', 'On demand (Ctrl+Space)']),
@@ -205,7 +201,6 @@ export const FIELDS: Field[] = [
   {
     section: 'editor',
     key: 'formatterKeywordCase',
-    arrives: 'M2',
     kind: 'select',
     label: 'Formatter keyword case',
     options: opts(['upper', 'UPPERCASE'], ['lower', 'lowercase'], ['preserve', 'Leave as typed']),
@@ -263,7 +258,6 @@ export const FIELDS: Field[] = [
   {
     section: 'execution',
     key: 'resultMemoryCapMb',
-    arrives: 'M2',
     kind: 'number',
     label: 'Result memory cap',
     min: 16,
@@ -278,7 +272,6 @@ export const FIELDS: Field[] = [
   {
     section: 'results',
     key: 'nullText',
-    arrives: 'M2',
     kind: 'text',
     label: 'NULL display text',
     maxLength: 32,
@@ -287,7 +280,6 @@ export const FIELDS: Field[] = [
   {
     section: 'results',
     key: 'dateTimeFormat',
-    arrives: 'M2',
     kind: 'text',
     label: 'Date/time format',
     placeholder: 'YYYY-MM-DD HH:mm:ss',
@@ -297,7 +289,6 @@ export const FIELDS: Field[] = [
   {
     section: 'results',
     key: 'timeZone',
-    arrives: 'M2',
     kind: 'select',
     label: 'Time zone',
     options: opts(['local', 'Local'], ['utc', 'UTC']),
@@ -306,7 +297,6 @@ export const FIELDS: Field[] = [
   {
     section: 'results',
     key: 'numberFormat',
-    arrives: 'M2',
     kind: 'select',
     label: 'Number format',
     options: opts(['plain', '1234567.89'], ['grouped', '1,234,567.89']),
@@ -315,7 +305,6 @@ export const FIELDS: Field[] = [
   {
     section: 'results',
     key: 'binaryDisplay',
-    arrives: 'M2',
     kind: 'select',
     label: 'Binary display',
     options: opts(['hex', 'Hex'], ['base64', 'Base64']),
@@ -324,7 +313,6 @@ export const FIELDS: Field[] = [
   {
     section: 'results',
     key: 'maxCellChars',
-    arrives: 'M2',
     kind: 'number',
     label: 'Max characters per cell',
     min: 20,
@@ -336,7 +324,6 @@ export const FIELDS: Field[] = [
   {
     section: 'results',
     key: 'jsonAutoDetect',
-    arrives: 'M2',
     kind: 'toggle',
     label: 'Detect JSON in text cells',
     help: 'Open the JSON viewer for any text cell that parses as JSON.',
@@ -389,25 +376,22 @@ export const FIELDS: Field[] = [
   {
     section: 'ai',
     key: 'autoSuggestFixes',
-    arrives: 'M3',
     kind: 'toggle',
     label: 'Suggest fixes automatically',
-    help: 'When a query fails with a syntax or schema error, show a fix as a diff to accept or dismiss. The request includes your query text, which may contain literals.',
+    help: 'When a query fails with a syntax or schema error, show a fix as a diff to accept or dismiss. The request includes your query text, which may contain literals. Off: a button under the error asks for one.',
     keywords: 'fix my query error diff',
   },
   {
     section: 'ai',
     key: 'sendSampleValues',
-    arrives: 'M3',
     kind: 'toggle',
     label: 'Send sample values (default for new connections)',
-    help: 'A few distinct values per low-cardinality column help the AI write WHERE filters. Off by default: otherwise only schema metadata is sent.',
+    help: 'A few common values of low-cardinality columns help the AI write WHERE filters. Each connection has its own switch; this is what new connections start with. Off: only schema metadata is sent. PostgreSQL only for now.',
     keywords: 'privacy row data samples',
   },
   {
     section: 'ai',
     key: 'schemaTokenBudget',
-    arrives: 'M3',
     kind: 'number',
     label: 'Schema token budget',
     min: 500,
@@ -420,12 +404,12 @@ export const FIELDS: Field[] = [
   {
     section: 'ai',
     key: 'requestTimeoutSecs',
-    arrives: 'M3',
     kind: 'number',
     label: 'Request timeout',
     min: 5,
     max: 600,
     unit: 'seconds',
+    help: 'How long the provider may stay silent before a request is given up. An answer that keeps arriving is never cut off.',
     keywords: 'llm provider',
   },
 
@@ -433,7 +417,6 @@ export const FIELDS: Field[] = [
   {
     section: 'privacy',
     key: 'keepHistory',
-    arrives: 'M2',
     kind: 'toggle',
     label: 'Keep query history',
     keywords: 'history log',
@@ -441,7 +424,6 @@ export const FIELDS: Field[] = [
   {
     section: 'privacy',
     key: 'historyRetentionDays',
-    arrives: 'M2',
     kind: 'number',
     label: 'History retention',
     min: 1,

@@ -1,9 +1,12 @@
 // Every keyboard-reachable action in the app. Shown in Settings → Keyboard.
 
+import { ai } from './ai.svelte';
 import { connections } from './connections.svelte';
 import { dialogs } from './dialogs.svelte';
 import { editorBridge } from './editorBridge';
-import { cancel, run, type RunScope } from './runner';
+import { formatSql } from './format';
+import { ipc } from './ipc';
+import { cancel, explain, run, type RunScope } from './runner';
 import { settings } from './settings.svelte';
 import type { Action } from './shortcuts';
 import { tabs } from './tabs.svelte';
@@ -21,6 +24,47 @@ function runActive(scope: RunScope): void {
   }
   editorBridge.markError(null);
   void run(tab, editorBridge.selection(), scope);
+}
+
+/** A file name without its folders. */
+const baseName = (path: string) => path.split(/[\\/]/).pop() ?? path;
+
+async function formatActive(): Promise<void> {
+  const tab = tabs.active;
+  if (!tab || tab.generated || !settings.value) return;
+  const { from, to } = editorBridge.selection();
+  const whole = from === to;
+  const source = whole ? editorBridge.text() : editorBridge.text().slice(from, to);
+  if (!source.trim()) return;
+  try {
+    const kind = connections.byId(tab.connectionId)?.kind ?? null;
+    const formatted = await formatSql(source, kind, settings.value.editor);
+    if (formatted !== source)
+      editorBridge.replace(formatted, whole ? 0 : from, whole ? undefined : to);
+  } catch {
+    // The formatter could not parse this SQL; leave the text exactly as it is.
+  }
+}
+
+async function openFile(): Promise<void> {
+  const file = await ipc.sqlFileOpen().catch(() => null);
+  if (!file) return;
+  tabs.open(settings.value?.execution.defaultRowLimit ?? 1000, file.text, {
+    title: baseName(file.path),
+    path: file.path,
+  });
+}
+
+async function saveFile(): Promise<void> {
+  const tab = tabs.active;
+  if (!tab || tab.generated) return;
+  const path = await ipc
+    .sqlFileSave(tab.path, tab.text, tab.title.replace(/\.sql$/i, ''))
+    .catch(() => null);
+  if (!path) return;
+  tab.path = path;
+  tab.title = baseName(path);
+  tab.savedText = tab.text;
 }
 
 export const ACTIONS: Action[] = [
@@ -47,6 +91,62 @@ export const ACTIONS: Action[] = [
       const tab = tabs.active;
       if (tab?.running) void cancel(tab);
     },
+  },
+  {
+    id: 'query.explain',
+    group: 'Query',
+    label: 'Explain statement (show the plan)',
+    chord: 'Mod+E',
+    run: () => {
+      const tab = tabs.active;
+      if (!tab || !connections.byId(tab.connectionId)) return;
+      editorBridge.markError(null);
+      void explain(tab, editorBridge.selection());
+    },
+  },
+  {
+    id: 'ai.ask',
+    group: 'AI',
+    label: 'Ask AI to write SQL',
+    chord: 'Mod+K',
+    run: () => {
+      if (tabs.active && !tabs.active.generated) void ai.openAsk();
+    },
+  },
+  {
+    id: 'ai.explain',
+    group: 'AI',
+    label: 'Explain SQL in plain English',
+    chord: 'Mod+Shift+K',
+    run: () => void ai.explain(),
+  },
+  {
+    id: 'editor.format',
+    group: 'Editor',
+    label: 'Format SQL',
+    chord: 'Mod+Shift+F',
+    run: () => void formatActive(),
+  },
+  {
+    id: 'file.open',
+    group: 'File',
+    label: 'Open SQL file…',
+    chord: 'Mod+O',
+    run: () => void openFile(),
+  },
+  {
+    id: 'file.save',
+    group: 'File',
+    label: 'Save as SQL file',
+    chord: 'Mod+S',
+    run: () => void saveFile(),
+  },
+  {
+    id: 'history.open',
+    group: 'Query',
+    label: 'Query history',
+    chord: 'Mod+Y',
+    run: () => (ui.historyOpen = true),
   },
   {
     id: 'connection.new',

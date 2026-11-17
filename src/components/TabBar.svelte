@@ -37,7 +37,7 @@
           onclick={() => (tabs.activeId = tab.id)}
           onauxclick={(e) => e.button === 1 && tabs.close(tab.id)}
         >
-          {tab.title}
+          {tab.title}{tab.path && tab.savedText !== tab.text ? ' •' : ''}
         </button>
         <button
           class="close"

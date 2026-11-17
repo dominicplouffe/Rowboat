@@ -22,7 +22,7 @@ use rowboat_lib::connections::{ConnectionConfig, TlsMode};
 use rowboat_lib::db::postgres::PgSession;
 use rowboat_lib::db::{ConnectParams, DbKind, ErrorKind, ExecOptions, QueryResult, Session};
 
-const ALL: ExecOptions = ExecOptions { row_limit: 0 };
+const ALL: ExecOptions = ExecOptions::limit(0);
 
 fn host() -> String {
     std::env::var("ROWBOAT_TEST_PG_HOST").unwrap_or_else(|_| "127.0.0.1".into())
@@ -96,7 +96,7 @@ async fn row_limit_fetches_one_page_of_a_huge_result() {
     let r = s
         .execute(
             "SELECT * FROM generate_series(1, 10000000) AS n",
-            ExecOptions { row_limit: 1000 },
+            ExecOptions::limit(1000),
         )
         .await
         .unwrap();
@@ -116,16 +116,13 @@ async fn row_limit_fetches_one_page_of_a_huge_result() {
 async fn exactly_the_limit_is_not_reported_as_more() {
     let s = connect().await;
     let r = s
-        .execute(
-            "SELECT generate_series(1, 50)",
-            ExecOptions { row_limit: 50 },
-        )
+        .execute("SELECT generate_series(1, 50)", ExecOptions::limit(50))
         .await
         .unwrap();
     assert_eq!(r.rows.len(), 50);
     assert!(!r.more_available);
     let none = s
-        .execute("SELECT 1 WHERE false", ExecOptions { row_limit: 50 })
+        .execute("SELECT 1 WHERE false", ExecOptions::limit(50))
         .await
         .unwrap();
     assert!(none.rows.is_empty() && !none.more_available && none.columns.len() == 1);
@@ -789,6 +786,200 @@ async fn navigator_lists_objects_and_prints_ddl() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn fetch_all_goes_in_batches_and_stops_at_the_memory_cap() {
+    let s = connect().await;
+    // More than two fetch batches, to cross batch boundaries.
+    let all = s
+        .execute("SELECT n FROM generate_series(1, 12345) AS n", ALL)
+        .await
+        .unwrap();
+    assert_eq!(all.rows.len(), 12345);
+    assert_eq!(all.rows[12344][0].as_deref(), Some("12345"));
+    assert!(!all.more_available && !all.stopped_at_memory_cap);
+
+    let capped = ExecOptions {
+        row_limit: 0,
+        max_bytes: 100_000,
+    };
+    let r = s
+        .execute(
+            "SELECT n, repeat('x', 50) FROM generate_series(1, 200000) AS n",
+            capped,
+        )
+        .await
+        .unwrap();
+    assert!(r.stopped_at_memory_cap && r.more_available);
+    assert!(r.rows.len() < 200_000, "{}", r.rows.len());
+    // The session is fine afterwards.
+    assert_eq!(scalar(&s.execute("SELECT 1", ALL).await.unwrap()), "1");
+}
+
+#[tokio::test]
+async fn results_from_one_table_with_its_key_are_editable() {
+    let s = connect().await;
+    let schema = format!("edit_{}", std::process::id());
+    for sql in [
+        format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+        format!("CREATE SCHEMA {schema}"),
+        format!("CREATE TABLE {schema}.items (id int PRIMARY KEY, name text, qty int)"),
+        format!("CREATE TABLE {schema}.pairs (a int, b int, v text, PRIMARY KEY (a, b))"),
+        format!("CREATE TABLE {schema}.nokey (v text)"),
+        format!("INSERT INTO {schema}.items VALUES (1, 'a', 1)"),
+    ] {
+        s.execute(&sql, ALL).await.unwrap();
+    }
+    let target = s
+        .execute(
+            &format!("SELECT name, id, qty * 2 AS doubled FROM {schema}.items"),
+            ALL,
+        )
+        .await
+        .unwrap()
+        .editable
+        .expect("editable");
+    assert_eq!(
+        (target.schema.as_str(), target.table.as_str()),
+        (schema.as_str(), "items")
+    );
+    assert_eq!(target.key, ["id"]);
+    assert_eq!(
+        target.columns,
+        [Some("name".into()), Some("id".into()), None]
+    );
+
+    let composite = s
+        .execute(&format!("SELECT * FROM {schema}.pairs"), ALL)
+        .await
+        .unwrap()
+        .editable
+        .unwrap();
+    assert_eq!(composite.key, ["a", "b"]);
+
+    for sql in [
+        format!("SELECT name FROM {schema}.items"),
+        format!("SELECT i.id, p.a FROM {schema}.items i, {schema}.pairs p"),
+        format!("SELECT * FROM {schema}.nokey"),
+        "SELECT 1".to_string(),
+    ] {
+        assert_eq!(s.execute(&sql, ALL).await.unwrap().editable, None, "{sql}");
+    }
+
+    // A key added later is noticed (the cached table shape is refreshed after DDL).
+    s.execute(
+        &format!("ALTER TABLE {schema}.nokey ADD COLUMN id int PRIMARY KEY DEFAULT 1"),
+        ALL,
+    )
+    .await
+    .unwrap();
+    assert!(s
+        .execute(&format!("SELECT * FROM {schema}.nokey"), ALL)
+        .await
+        .unwrap()
+        .editable
+        .is_some());
+    s.execute(&format!("DROP SCHEMA {schema} CASCADE"), ALL)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn export_streams_every_row() {
+    let s = connect().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("out.csv");
+    let writer = rowboat_lib::export::Writer::new(
+        std::io::BufWriter::new(std::fs::File::create(&path).unwrap()),
+        rowboat_lib::export::Options {
+            format: rowboat_lib::export::Format::Csv,
+            kind: DbKind::Postgres,
+            table: "t".into(),
+        },
+    );
+    let written = s
+        .export(
+            "SELECT n, 'row ' || n AS label FROM generate_series(1, 23456) AS n",
+            Box::new(writer),
+        )
+        .await
+        .unwrap();
+    assert_eq!(written, 23456);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 23457);
+    assert_eq!(
+        (lines[0], lines[1], lines[23456]),
+        ("n,label", "1,row 1", "23456,row 23456")
+    );
+    assert_eq!(scalar(&s.execute("SELECT 1", ALL).await.unwrap()), "1");
+}
+
+#[tokio::test]
+async fn snapshot_describes_tables_keys_and_functions() {
+    let s = connect().await;
+    let schema = format!("snap_{}", std::process::id());
+    for sql in [
+        format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+        format!("CREATE SCHEMA {schema}"),
+        format!("CREATE TABLE {schema}.customers (id int PRIMARY KEY, name text)"),
+        format!(
+            "CREATE TABLE {schema}.orders (id int PRIMARY KEY, customer_id int REFERENCES {schema}.customers (id), total numeric(10,2))"
+        ),
+        format!("CREATE VIEW {schema}.big AS SELECT id FROM {schema}.orders WHERE total > 100"),
+    ] {
+        s.execute(&sql, ALL).await.unwrap();
+    }
+    let snapshot = s.snapshot().await.unwrap();
+    assert!(snapshot.search_path.contains(&"public".to_string()));
+    let ours: Vec<_> = snapshot
+        .tables
+        .iter()
+        .filter(|t| t.schema == schema)
+        .collect();
+    let names: Vec<_> = ours.iter().map(|t| (t.name.as_str(), t.kind)).collect();
+    assert_eq!(
+        names,
+        [("big", "view"), ("customers", "table"), ("orders", "table")]
+    );
+    let orders = ours[2];
+    assert_eq!(
+        orders
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        ["id", "customer_id", "total"]
+    );
+    assert!(orders.columns[0].primary_key && !orders.columns[1].primary_key);
+    assert_eq!(orders.columns[2].type_name, "numeric(10,2)");
+    assert_eq!(orders.foreign_keys.len(), 1);
+    let key = &orders.foreign_keys[0];
+    assert_eq!(
+        (
+            key.columns.clone(),
+            key.ref_schema.as_str(),
+            key.ref_table.as_str(),
+            key.ref_columns.clone()
+        ),
+        (
+            vec!["customer_id".to_string()],
+            schema.as_str(),
+            "customers",
+            vec!["id".to_string()]
+        )
+    );
+    let lower = snapshot
+        .functions
+        .iter()
+        .find(|f| f.name == "lower")
+        .expect("lower()");
+    assert!(lower.signature.starts_with('('));
+    assert!(!snapshot.tables.iter().any(|t| t.schema == "pg_catalog"));
+    s.execute(&format!("DROP SCHEMA {schema} CASCADE"), ALL)
+        .await
+        .unwrap();
+}
+
 // ------------------------------------------------------------------ TLS ----
 
 fn tls_dir() -> Option<std::path::PathBuf> {
@@ -890,4 +1081,97 @@ async fn client_certificate_authenticates_without_a_password() {
         PgSession::connect(p).await.is_err(),
         "no certificate, no login"
     );
+}
+
+#[tokio::test]
+async fn details_add_comments_nullability_enums_indexes_and_opt_in_samples() {
+    let s = connect().await;
+    let schema = format!("det_{}", std::process::id());
+    for sql in [
+        format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+        format!("CREATE SCHEMA {schema}"),
+        format!("CREATE TYPE {schema}.order_status AS ENUM ('new', 'paid', 'shipped')"),
+        format!(
+            "CREATE TABLE {schema}.orders (id int PRIMARY KEY, status {schema}.order_status NOT NULL, \
+             channel text, note text)"
+        ),
+        format!("COMMENT ON TABLE {schema}.orders IS 'One row per checkout'"),
+        format!("COMMENT ON COLUMN {schema}.orders.note IS 'Free text from support'"),
+        format!("CREATE UNIQUE INDEX ON {schema}.orders (channel, id)"),
+        format!(
+            "INSERT INTO {schema}.orders SELECT n, 'paid', (ARRAY['web', 'store'])[1 + n % 2], 'secret note ' || n \
+             FROM generate_series(1, 400) n"
+        ),
+        format!("ANALYZE {schema}.orders"),
+    ] {
+        s.execute(&sql, ALL).await.unwrap();
+    }
+
+    let find = |details: &rowboat_lib::db::SchemaDetails| {
+        details
+            .tables
+            .iter()
+            .find(|t| t.schema == schema && t.name == "orders")
+            .cloned()
+            .expect("the table is described")
+    };
+    let details = s.details(false).await.unwrap();
+    assert!(!details.server_version.is_empty());
+    let orders = find(&details);
+    assert_eq!(orders.comment, "One row per checkout");
+    assert_eq!(orders.row_estimate, Some(400));
+    assert_eq!(
+        orders.indexes,
+        ["unique btree (channel, id)"],
+        "the primary key is not repeated"
+    );
+    let column = |name: &str| {
+        orders
+            .columns
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap()
+            .clone()
+    };
+    assert!(!column("status").nullable && column("channel").nullable);
+    assert_eq!(
+        column("status").values,
+        ["new", "paid", "shipped"],
+        "enum labels"
+    );
+    assert_eq!(column("note").comment, "Free text from support");
+    assert!(
+        column("channel").values.is_empty(),
+        "no data values unless asked for"
+    );
+
+    let with_samples = find(&s.details(true).await.unwrap());
+    let column = |name: &str| {
+        with_samples
+            .columns
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap()
+            .clone()
+    };
+    let mut channels = column("channel").values;
+    channels.sort();
+    assert_eq!(
+        channels,
+        ["store", "web"],
+        "common values of a low-cardinality column"
+    );
+    assert!(
+        column("note").values.is_empty(),
+        "high-cardinality columns are never sampled"
+    );
+    assert_eq!(
+        column("status").values,
+        ["new", "paid", "shipped"],
+        "enum labels are left alone"
+    );
+
+    s.execute(&format!("DROP SCHEMA {schema} CASCADE"), ALL)
+        .await
+        .unwrap();
 }

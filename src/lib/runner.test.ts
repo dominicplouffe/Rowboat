@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { blankConnection, connections } from './connections.svelte';
+import { ipc } from './ipc';
 import { errorOffset, prompts, run, statementAtCursor } from './runner';
 import { settings } from './settings.svelte';
 import { tabs, type Tab } from './tabs.svelte';
@@ -191,5 +192,38 @@ describe('running statements', () => {
     tab.text = 'drop table users';
     await run(tab, cursor(0), 'script');
     expect(tab.runs).toEqual([]);
+  });
+
+  it('never runs a data-changing statement again to fetch more rows', async () => {
+    const { fetchAll, fetchNextPage, countRows } = await import('./runner');
+    tab.rowLimit = 100;
+    tab.text = 'update orders set total = total + 1 returning *';
+    await run(tab, cursor(0), 'statement');
+    const first = tab.runs[0].result!;
+    expect(first.moreAvailable).toBe(true);
+    expect(first.repeatable).toBe(false);
+
+    const before = (await ipc.historySearch(null, '')).length;
+    await fetchNextPage(tab);
+    await fetchAll(tab);
+    await countRows(tab);
+    expect((await ipc.historySearch(null, '')).length).toBe(before); // nothing reached the database
+    expect(tab.runs[0].result).toBe(first);
+  });
+
+  it('does not refetch while edits are staged, since they are addressed by row position', async () => {
+    const { fetchNextPage } = await import('./runner');
+    tab.rowLimit = 100;
+    tab.text = 'select * from orders';
+    await run(tab, cursor(0), 'statement');
+    const statement = tab.runs[0];
+    statement.edits = { 3: { 1: 'changed' } };
+    await fetchNextPage(tab);
+    expect(statement.result!.rows).toHaveLength(100);
+    expect(statement.note).toMatch(/Apply or discard your edits/);
+
+    statement.edits = {};
+    await fetchNextPage(tab);
+    expect(tab.runs[0].result!.rows).toHaveLength(200);
   });
 });

@@ -25,7 +25,7 @@ pub enum DbKind {
 }
 
 /// Broad category of a column, for alignment and (later) type-aware cells.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ColumnKind {
     Text,
@@ -37,7 +37,7 @@ pub enum ColumnKind {
     Other,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Column {
     pub name: String,
@@ -64,12 +64,124 @@ pub struct QueryResult {
     pub notices: Vec<String>,
     /// Whether the session is inside an open transaction after this statement.
     pub in_transaction: bool,
+    /// True when fetching stopped at the result memory cap.
+    pub stopped_at_memory_cap: bool,
+    /// Set when the rows come from a single table whose primary key is in the
+    /// result, which is what makes inline editing possible.
+    pub editable: Option<EditTarget>,
+    /// Driver-internal: for PostgreSQL, the (table oid, column number) behind
+    /// each result column, resolved into `editable` before the result leaves
+    /// the driver.
+    #[serde(skip)]
+    pub source_ids: Vec<Option<(u32, i16)>>,
+}
+
+/// Where the rows of an editable result live.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditTarget {
+    /// Empty for databases without schemas (SQLite).
+    pub schema: String,
+    pub table: String,
+    /// The table column behind each result column; `None` for expressions.
+    pub columns: Vec<Option<String>>,
+    /// The primary-key columns (all present in `columns`).
+    pub key: Vec<String>,
+}
+
+// ------------------------------------------------- schema for autocomplete ----
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotColumn {
+    pub name: String,
+    pub type_name: String,
+    pub primary_key: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForeignKey {
+    pub columns: Vec<String>,
+    pub ref_schema: String,
+    pub ref_table: String,
+    pub ref_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotTable {
+    /// Schema (PostgreSQL) or database (ClickHouse); empty for SQLite.
+    pub schema: String,
+    pub name: String,
+    /// `table` or `view`.
+    pub kind: &'static str,
+    pub columns: Vec<SnapshotColumn>,
+    pub foreign_keys: Vec<ForeignKey>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotFunction {
+    pub name: String,
+    /// Argument list for the hint, e.g. `(text, integer)`. Empty if unknown.
+    pub signature: String,
+}
+
+/// Everything autocomplete needs, fetched once and cached in the UI.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchemaSnapshot {
+    /// Schemas searched for unqualified names, in order.
+    pub search_path: Vec<String>,
+    pub tables: Vec<SnapshotTable>,
+    pub functions: Vec<SnapshotFunction>,
+}
+
+/// What the AI schema index needs beyond the autocomplete snapshot. Every
+/// field is best effort: a driver fills what its catalog offers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchemaDetails {
+    pub server_version: String,
+    pub tables: Vec<TableDetails>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableDetails {
+    pub schema: String,
+    pub name: String,
+    pub comment: String,
+    pub row_estimate: Option<i64>,
+    /// One short description per secondary index, e.g. `unique btree (email)`.
+    pub indexes: Vec<String>,
+    /// ClickHouse: engine, ORDER BY and partition key.
+    pub storage: String,
+    pub columns: Vec<ColumnDetails>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColumnDetails {
+    pub name: String,
+    pub nullable: bool,
+    pub comment: String,
+    /// Enum labels, or (only when asked for) a few sample values.
+    pub values: Vec<String>,
+}
+
+// ------------------------------------------------------------- streaming ----
+
+/// Receives a result row by row, for exports that must not hold the whole
+/// result in memory.
+pub trait RowSink: Send {
+    fn start(&mut self, columns: &[Column]) -> std::io::Result<()>;
+    fn row(&mut self, cells: &[Cell]) -> std::io::Result<()>;
+    fn finish(&mut self) -> std::io::Result<()>;
 }
 
 /// What went wrong, in a form the UI and (later) the AI can act on. The
 /// distinction matters: only syntax and schema errors are sent to the AI for
 /// a suggested fix; connection and permission errors never are.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ErrorKind {
     Syntax,
@@ -135,6 +247,31 @@ pub type DbResult<T> = Result<T, DbError>;
 pub struct ExecOptions {
     /// Maximum rows to fetch; 0 means no limit.
     pub row_limit: u32,
+    /// Stop fetching once the result holds about this many bytes; 0 means no
+    /// cap. This is the "result memory cap" behind Fetch all.
+    pub max_bytes: u64,
+}
+
+impl ExecOptions {
+    pub const fn limit(row_limit: u32) -> Self {
+        Self {
+            row_limit,
+            max_bytes: 0,
+        }
+    }
+
+    /// True when a result of `rows` rows and `bytes` bytes must stop growing
+    /// because of the memory cap.
+    pub fn over_memory(&self, bytes: u64) -> bool {
+        self.max_bytes > 0 && bytes > self.max_bytes
+    }
+}
+
+/// Approximate memory a row of cells takes once it reaches the UI.
+pub fn row_bytes(row: &[Cell]) -> u64 {
+    row.iter()
+        .map(|cell| 16 + cell.as_ref().map_or(0, |text| text.len() as u64))
+        .sum()
 }
 
 /// A node in the schema navigator.
@@ -216,6 +353,21 @@ pub trait Session: Send + Sync {
     async fn children(&self, path: &[String]) -> DbResult<Vec<SchemaNode>>;
     /// DDL for the object at `path`.
     async fn ddl(&self, path: &[String]) -> DbResult<String>;
+
+    /// Tables, columns, keys and functions for autocomplete.
+    async fn snapshot(&self) -> DbResult<SchemaSnapshot>;
+
+    /// Extra catalog facts for the AI schema index. `samples` asks for a few
+    /// example values of low-cardinality columns: the only place row data can
+    /// enter an AI prompt, and off unless the user turns it on.
+    async fn details(&self, samples: bool) -> DbResult<SchemaDetails> {
+        let _ = samples;
+        Ok(SchemaDetails::default())
+    }
+
+    /// Runs a statement and feeds every row to `sink` without keeping them.
+    /// Returns the number of rows written.
+    async fn export(&self, sql: &str, sink: Box<dyn RowSink>) -> DbResult<u64>;
 
     async fn close(&self);
 }

@@ -30,6 +30,11 @@ use super::{
     quote_ident, quote_literal, Column, ConnectParams, DbError, DbKind, DbResult, ErrorKind,
     ExecOptions, QueryResult, SchemaNode, Session,
 };
+use super::{ColumnDetails, SchemaDetails, TableDetails};
+use super::{
+    EditTarget, ForeignKey, RowSink, SchemaSnapshot, SnapshotColumn, SnapshotFunction,
+    SnapshotTable,
+};
 use crate::connections::TlsMode;
 use crate::statements::{tx_control, TxControl};
 
@@ -37,6 +42,7 @@ type Reply<T> = oneshot::Sender<DbResult<T>>;
 
 enum Command {
     Execute(String, ExecOptions, Reply<QueryResult>),
+    Export(String, Box<dyn RowSink>, Reply<u64>),
     EndTransaction { commit: bool, reply: Reply<()> },
     Close,
 }
@@ -68,6 +74,8 @@ pub struct PgSession {
     shared: Arc<Shared>,
     version: String,
     params: ConnectParams,
+    /// Table name and key columns by table oid, for inline editing.
+    tables: Mutex<std::collections::HashMap<u32, Option<TableInfo>>>,
     /// A second connection for the navigator, opened on first use. Catalog
     /// queries must never run inside the user's transaction (a failing one
     /// would abort it) or wait behind the user's long query.
@@ -344,6 +352,7 @@ impl PgSession {
             shared,
             version,
             params,
+            tables: Mutex::new(Default::default()),
             catalog: tokio::sync::Mutex::new(None),
         })
     }
@@ -365,10 +374,96 @@ impl PgSession {
             *slot = Some(open(&self.params, &Shared::new(true)).await?);
         }
         let client = slot.as_mut().expect("just opened");
-        run_auto_commit(client, &sql, ExecOptions { row_limit: 0 })
+        run_auto_commit(client, &sql, ExecOptions::limit(0))
             .await
             .map(|result| result.rows)
             .map_err(map_error)
+    }
+}
+
+#[derive(Clone)]
+struct TableInfo {
+    schema: String,
+    table: String,
+    /// Column name by attribute number.
+    columns: std::collections::HashMap<i16, String>,
+    key: Vec<String>,
+}
+
+impl PgSession {
+    async fn table_info(&self, oid: u32) -> Option<TableInfo> {
+        if let Some(known) = self
+            .tables
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&oid)
+        {
+            return known.clone();
+        }
+        let lookup = async {
+            let relation = self
+                .catalog(format!(
+                    "SELECT n.nspname, c.relname FROM pg_catalog.pg_class c \
+                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE c.oid = {oid} AND c.relkind IN ('r', 'p')"
+                ))
+                .await
+                .ok()?;
+            let relation = relation.first()?;
+            let attributes = self
+                .catalog(format!(
+                    "SELECT a.attnum::text, a.attname, COALESCE(a.attnum = ANY (i.indkey), false)::text \
+                     FROM pg_catalog.pg_attribute a \
+                     LEFT JOIN pg_catalog.pg_index i ON i.indrelid = a.attrelid AND i.indisprimary \
+                     WHERE a.attrelid = {oid} AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum"
+                ))
+                .await
+                .ok()?;
+            let mut info = TableInfo {
+                schema: cell(relation, 0),
+                table: cell(relation, 1),
+                columns: Default::default(),
+                key: vec![],
+            };
+            for row in &attributes {
+                let name = cell(row, 1);
+                if cell(row, 2) == "true" {
+                    info.key.push(name.clone());
+                }
+                info.columns.insert(cell(row, 0).parse().ok()?, name);
+            }
+            Some(info)
+        };
+        let info = lookup.await;
+        self.tables
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(oid, info.clone());
+        info
+    }
+
+    /// Works out whether a result can be edited in place: every source column
+    /// comes from one table, and that table's whole primary key is included.
+    async fn edit_target(&self, sources: &[Option<(u32, i16)>]) -> Option<EditTarget> {
+        let oid = sources.iter().flatten().map(|(oid, _)| *oid).next()?;
+        if sources.iter().flatten().any(|(other, _)| *other != oid) {
+            return None;
+        }
+        let info = self.table_info(oid).await?;
+        let columns: Vec<Option<String>> = sources
+            .iter()
+            .map(|source| source.and_then(|(_, number)| info.columns.get(&number).cloned()))
+            .collect();
+        let has = |name: &String| columns.iter().flatten().any(|c| c == name);
+        if info.key.is_empty() || !info.key.iter().all(has) {
+            return None;
+        }
+        Some(EditTarget {
+            schema: info.schema,
+            table: info.table,
+            columns,
+            key: info.key,
+        })
     }
 }
 
@@ -392,7 +487,67 @@ async fn fetch(
             ..Default::default()
         });
     }
-    let columns = statement
+    let columns = describe(&statement);
+    let source_ids = statement
+        .columns()
+        .iter()
+        .map(|c| c.table_oid().zip(c.column_id()))
+        .collect();
+
+    // The server-side cursor: a portal executed for a bounded number of rows.
+    // With a limit, ask for one row more, so "more available" is known
+    // without fetching the rest. Without one, fetch in batches so the memory
+    // cap can stop the fetch between them.
+    let limit = options.row_limit as usize;
+    let batch = if limit == 0 {
+        FETCH_BATCH
+    } else {
+        (limit + 1).min(i32::MAX as usize)
+    };
+    let portal = tx.bind(&statement, &[]).await?;
+
+    let mut rows = Vec::new();
+    let mut more = false;
+    let mut bytes = 0u64;
+    let mut stopped_at_memory_cap = false;
+    loop {
+        let stream = tx.query_portal_raw(&portal, batch as i32).await?;
+        pin_mut!(stream);
+        let mut received = 0usize;
+        while let Some(row) = stream.try_next().await? {
+            received += 1;
+            if limit > 0 && rows.len() == limit {
+                more = true;
+                continue; // the one extra row; drain so the protocol stays in step
+            }
+            let cells = render_row(&row)?;
+            bytes += super::row_bytes(&cells);
+            rows.push(cells);
+        }
+        let exhausted = received < batch;
+        if options.over_memory(bytes) && !exhausted {
+            stopped_at_memory_cap = true;
+            more = true;
+        }
+        if exhausted || limit > 0 || stopped_at_memory_cap {
+            break;
+        }
+    }
+    Ok(QueryResult {
+        columns,
+        rows,
+        more_available: more,
+        stopped_at_memory_cap,
+        source_ids,
+        ..Default::default()
+    })
+}
+
+/// Rows per round trip when no row limit applies.
+const FETCH_BATCH: usize = 5000;
+
+fn describe(statement: &tokio_postgres::Statement) -> Vec<Column> {
+    statement
         .columns()
         .iter()
         .map(|c| Column {
@@ -400,40 +555,47 @@ async fn fetch(
             type_name: c.type_().name().to_string(),
             kind: column_kind(c.type_()),
         })
-        .collect();
+        .collect()
+}
 
-    // The server-side cursor: ask the portal for one row more than the limit,
-    // so "more available" is known without fetching the rest.
-    let limit = options.row_limit as usize;
-    let ask = if limit == 0 {
-        0
-    } else {
-        (limit + 1).min(i32::MAX as usize) as i32
-    };
-    let portal = tx.bind(&statement, &[]).await?;
-    let stream = tx.query_portal_raw(&portal, ask).await?;
-    pin_mut!(stream);
-
-    let mut rows = Vec::new();
-    let mut more = false;
-    while let Some(row) = stream.try_next().await? {
-        if limit > 0 && rows.len() == limit {
-            more = true;
-            continue; // the one extra row; drain so the protocol stays in step
-        }
-        let mut cells = Vec::with_capacity(row.len());
-        for (i, column) in row.columns().iter().enumerate() {
-            let raw: Raw = row.try_get(i)?;
-            cells.push(raw.0.map(|bytes| render(column.type_(), bytes)));
-        }
-        rows.push(cells);
+fn render_row(row: &tokio_postgres::Row) -> Result<Vec<Option<String>>, tokio_postgres::Error> {
+    let mut cells = Vec::with_capacity(row.len());
+    for (i, column) in row.columns().iter().enumerate() {
+        let raw: Raw = row.try_get(i)?;
+        cells.push(raw.0.map(|bytes| render(column.type_(), bytes)));
     }
-    Ok(QueryResult {
-        columns,
-        rows,
-        more_available: more,
-        ..Default::default()
-    })
+    Ok(cells)
+}
+
+/// Streams a whole result to `sink`, a batch at a time.
+async fn export_in(tx: &Transaction<'_>, sql: &str, sink: &mut dyn RowSink) -> DbResult<u64> {
+    let io = |e: std::io::Error| DbError::other(format!("Could not write the export: {e}"));
+    let statement = tx.prepare(sql).await.map_err(map_error)?;
+    if statement.columns().is_empty() {
+        return Err(DbError::other("This statement returns no rows to export."));
+    }
+    sink.start(&describe(&statement)).map_err(io)?;
+    let portal = tx.bind(&statement, &[]).await.map_err(map_error)?;
+    let mut written = 0u64;
+    loop {
+        let stream = tx
+            .query_portal_raw(&portal, FETCH_BATCH as i32)
+            .await
+            .map_err(map_error)?;
+        pin_mut!(stream);
+        let mut received = 0usize;
+        while let Some(row) = stream.try_next().await.map_err(map_error)? {
+            received += 1;
+            sink.row(&render_row(&row).map_err(map_error)?)
+                .map_err(io)?;
+        }
+        written += received as u64;
+        if received < FETCH_BATCH {
+            break;
+        }
+    }
+    sink.finish().map_err(io)?;
+    Ok(written)
 }
 
 /// Runs a statement outside any user transaction.
@@ -528,6 +690,9 @@ async fn serve(
                         Command::Execute(_, _, reply) => {
                             let _ = reply.send(Err(error));
                         }
+                        Command::Export(_, _, reply) => {
+                            let _ = reply.send(Err(error));
+                        }
                         Command::EndTransaction { reply, .. } => {
                             let _ = reply.send(Err(error));
                         }
@@ -550,6 +715,15 @@ async fn serve(
             Command::Close => break,
             Command::EndTransaction { reply, .. } => {
                 let _ = reply.send(Ok(()));
+            }
+            Command::Export(sql, mut sink, reply) => {
+                // A read in its own transaction; nothing to keep afterwards.
+                let result = match client.transaction().await {
+                    Ok(tx) => export_in(&tx, &sql, sink.as_mut()).await,
+                    Err(error) => Err(map_error(error)),
+                };
+                shared.take_notices();
+                let _ = reply.send(result);
             }
             Command::Execute(sql, options, reply) => {
                 if is_stream_copy(&sql) {
@@ -652,6 +826,11 @@ async fn in_transaction(
         let current = tx.as_ref().expect("transaction is open");
         match command {
             Command::Close => break,
+            Command::Export(sql, mut sink, reply) => {
+                let result = export_in(current, &sql, sink.as_mut()).await;
+                shared.take_notices();
+                let _ = reply.send(result);
+            }
             Command::EndTransaction { commit, reply } => {
                 let tx = tx.take().expect("transaction is open");
                 let result = end_transaction(tx, commit).await;
@@ -749,8 +928,19 @@ impl Session for PgSession {
 
     async fn execute(&self, sql: &str, options: ExecOptions) -> DbResult<QueryResult> {
         let sql = sql.to_string();
-        self.request(|reply| Command::Execute(sql, options, reply))
-            .await
+        let mut result = self
+            .request(|reply| Command::Execute(sql, options, reply))
+            .await?;
+        if result.columns.is_empty() {
+            // Possibly DDL: table shapes and keys may have changed.
+            self.tables
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        } else {
+            result.editable = self.edit_target(&result.source_ids).await;
+        }
+        Ok(result)
     }
 
     async fn cancel(&self) {
@@ -1067,6 +1257,246 @@ impl Session for PgSession {
                 "Select a table, view, function, sequence or type.",
             )),
         }
+    }
+
+    async fn snapshot(&self) -> DbResult<SchemaSnapshot> {
+        const USER_SCHEMAS: &str =
+            "n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast|temp)'";
+        let search_path = self
+            .catalog("SELECT unnest(current_schemas(false))::text".into())
+            .await?
+            .iter()
+            .map(|row| cell(row, 0))
+            .collect();
+
+        let mut tables: Vec<SnapshotTable> = Vec::new();
+        let columns = self
+            .catalog(format!(
+                "SELECT n.nspname, c.relname, c.relkind::text, a.attname, \
+                        pg_catalog.format_type(a.atttypid, a.atttypmod), \
+                        COALESCE(a.attnum = ANY (i.indkey), false)::text \
+                 FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped \
+                 LEFT JOIN pg_catalog.pg_index i ON i.indrelid = c.oid AND i.indisprimary \
+                 WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND {USER_SCHEMAS} \
+                 ORDER BY n.nspname, c.relname, a.attnum"
+            ))
+            .await?;
+        for row in &columns {
+            let (schema, name) = (cell(row, 0), cell(row, 1));
+            if tables
+                .last()
+                .is_none_or(|t| t.schema != schema || t.name != name)
+            {
+                tables.push(SnapshotTable {
+                    schema,
+                    name,
+                    kind: if matches!(cell(row, 2).as_str(), "v" | "m") {
+                        "view"
+                    } else {
+                        "table"
+                    },
+                    ..Default::default()
+                });
+            }
+            tables
+                .last_mut()
+                .expect("just pushed")
+                .columns
+                .push(SnapshotColumn {
+                    name: cell(row, 3),
+                    type_name: cell(row, 4),
+                    primary_key: cell(row, 5) == "true",
+                });
+        }
+
+        let keys = self
+            .catalog(format!(
+                "SELECT n.nspname, c.relname, con.oid::text, a.attname, fn.nspname, fc.relname, fa.attname \
+                 FROM pg_catalog.pg_constraint con \
+                 JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 JOIN pg_catalog.pg_class fc ON fc.oid = con.confrelid \
+                 JOIN pg_catalog.pg_namespace fn ON fn.oid = fc.relnamespace \
+                 CROSS JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS k(col, refcol, ord) \
+                 JOIN pg_catalog.pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.col \
+                 JOIN pg_catalog.pg_attribute fa ON fa.attrelid = con.confrelid AND fa.attnum = k.refcol \
+                 WHERE con.contype = 'f' AND {USER_SCHEMAS} ORDER BY 1, 2, 3, k.ord"
+            ))
+            .await?;
+        let mut last = String::new();
+        for row in &keys {
+            let Some(owner) = tables
+                .iter_mut()
+                .find(|t| t.schema == cell(row, 0) && t.name == cell(row, 1))
+            else {
+                continue;
+            };
+            if cell(row, 2) != last {
+                last = cell(row, 2);
+                owner.foreign_keys.push(ForeignKey {
+                    ref_schema: cell(row, 4),
+                    ref_table: cell(row, 5),
+                    ..Default::default()
+                });
+            }
+            let key = owner.foreign_keys.last_mut().expect("just pushed");
+            key.columns.push(cell(row, 3));
+            key.ref_columns.push(cell(row, 6));
+        }
+
+        let functions = self
+            .catalog(
+                "SELECT DISTINCT ON (p.proname) p.proname, \
+                        '(' || pg_catalog.pg_get_function_arguments(p.oid) || ')' \
+                 FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE p.prokind IN ('f', 'a', 'w') AND n.nspname <> 'information_schema' \
+                   AND p.proname !~ '^(pg_|_|RI_)' AND p.proname !~ '(_in|_out|_recv|_send|sel|joinsel)$' \
+                 ORDER BY p.proname, p.pronargs"
+                    .into(),
+            )
+            .await?
+            .iter()
+            .map(|row| SnapshotFunction {
+                name: cell(row, 0),
+                signature: cell(row, 1),
+            })
+            .collect();
+
+        Ok(SchemaSnapshot {
+            search_path,
+            tables,
+            functions,
+        })
+    }
+
+    async fn details(&self, samples: bool) -> DbResult<SchemaDetails> {
+        const USER_SCHEMAS: &str =
+            "n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast|temp)'";
+        let mut details = SchemaDetails {
+            server_version: self
+                .catalog("SHOW server_version".into())
+                .await?
+                .first()
+                .map(|row| cell(row, 0))
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        for row in &self
+            .catalog(format!(
+                "SELECT n.nspname, c.relname, COALESCE(pg_catalog.obj_description(c.oid, 'pg_class'), ''), \
+                        c.reltuples::bigint::text \
+                 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND {USER_SCHEMAS} \
+                 ORDER BY n.nspname, c.relname"
+            ))
+            .await?
+        {
+            details.tables.push(TableDetails {
+                schema: cell(row, 0),
+                name: cell(row, 1),
+                comment: cell(row, 2),
+                // -1 means the table has never been analyzed.
+                row_estimate: cell(row, 3).parse().ok().filter(|n: &i64| *n >= 0),
+                ..Default::default()
+            });
+        }
+        fn table<'a>(
+            tables: &'a mut [TableDetails],
+            row: &[Option<String>],
+        ) -> Option<&'a mut TableDetails> {
+            let (schema, name) = (cell(row, 0), cell(row, 1));
+            tables
+                .iter_mut()
+                .find(|t| t.schema == schema && t.name == name)
+        }
+
+        for row in &self
+            .catalog(format!(
+                "SELECT n.nspname, c.relname, a.attname, (NOT a.attnotnull)::text, \
+                        COALESCE(pg_catalog.col_description(c.oid, a.attnum), ''), \
+                        COALESCE((SELECT string_agg(e.enumlabel, chr(31) ORDER BY e.enumsortorder) \
+                                  FROM pg_catalog.pg_enum e WHERE e.enumtypid = a.atttypid), '') \
+                 FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped \
+                 WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND {USER_SCHEMAS} \
+                 ORDER BY n.nspname, c.relname, a.attnum"
+            ))
+            .await?
+        {
+            if let Some(owner) = table(&mut details.tables, row) {
+                let labels = cell(row, 5);
+                owner.columns.push(ColumnDetails {
+                    name: cell(row, 2),
+                    nullable: cell(row, 3) == "true",
+                    comment: cell(row, 4),
+                    values: if labels.is_empty() {
+                        Vec::new()
+                    } else {
+                        labels.split('\u{1f}').map(str::to_string).collect()
+                    },
+                });
+            }
+        }
+
+        for row in &self
+            .catalog(format!(
+                "SELECT n.nspname, c.relname, \
+                        (CASE WHEN i.indisunique THEN 'unique ' ELSE '' END) || pg_catalog.pg_get_indexdef(i.indexrelid) \
+                 FROM pg_catalog.pg_index i \
+                 JOIN pg_catalog.pg_class c ON c.oid = i.indrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE NOT i.indisprimary AND {USER_SCHEMAS} ORDER BY 1, 2, 3"
+            ))
+            .await?
+        {
+            if let Some(owner) = table(&mut details.tables, row) {
+                // "unique CREATE UNIQUE INDEX x ON t USING btree (a)" → "unique btree (a)"
+                let def = cell(row, 2);
+                let unique = if def.starts_with("unique ") { "unique " } else { "" };
+                if let Some((_, using)) = def.split_once(" USING ") {
+                    owner.indexes.push(format!("{unique}{using}"));
+                }
+            }
+        }
+
+        if samples {
+            // The planner's statistics already hold the most common values, so
+            // no table is scanned for this.
+            let rows = self
+                .catalog(
+                    "SELECT s.schemaname, s.tablename, s.attname, left(u.v, 40) \
+                     FROM pg_catalog.pg_stats s, \
+                          unnest(s.most_common_vals::text::text[]) WITH ORDINALITY AS u(v, ord) \
+                     WHERE s.n_distinct > 0 AND s.n_distinct <= 12 AND u.ord <= 6 \
+                       AND s.schemaname NOT IN ('pg_catalog', 'information_schema') \
+                     ORDER BY 1, 2, 3, u.ord"
+                        .into(),
+                )
+                .await
+                .unwrap_or_default();
+            for row in &rows {
+                let Some(owner) = table(&mut details.tables, row) else {
+                    continue;
+                };
+                let name = cell(row, 2);
+                if let Some(column) = owner.columns.iter_mut().find(|c| c.name == name) {
+                    // Enum labels are already complete; do not mix samples in.
+                    if column.values.len() < 6 && !column.values.contains(&cell(row, 3)) {
+                        column.values.push(cell(row, 3));
+                    }
+                }
+            }
+        }
+        Ok(details)
+    }
+
+    async fn export(&self, sql: &str, sink: Box<dyn RowSink>) -> DbResult<u64> {
+        let sql = sql.to_string();
+        self.request(|reply| Command::Export(sql, sink, reply))
+            .await
     }
 
     async fn close(&self) {

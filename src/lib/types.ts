@@ -53,6 +53,9 @@ export interface Settings {
     sshKnownHosts: 'ask' | 'strict' | 'accept-new';
   };
   ai: {
+    providers: AiProvider[];
+    /** Id of the provider in use; empty = AI is off. */
+    defaultProvider: string;
     autoSuggestFixes: boolean;
     sendSampleValues: boolean;
     schemaTokenBudget: number;
@@ -111,6 +114,9 @@ export interface ConnectionConfig {
   };
   path: string;
   create: boolean;
+  /** Off = nothing about this connection is ever sent to an AI provider. */
+  aiEnabled: boolean;
+  aiSampleValues: boolean;
 }
 
 /** A saved connection as the UI sees it: whether secrets exist, never their values. */
@@ -171,7 +177,16 @@ export interface RunResult {
   raw: string | null;
   notices: string[];
   inTransaction: boolean;
+  /** True when fetching stopped at the result memory cap. */
+  stoppedAtMemoryCap: boolean;
+  /** Set when the rows can be edited in place. */
+  editable: EditTarget | null;
   elapsedMs: number;
+  /**
+   * False for a statement that changes data: it must not be run again to
+   * fetch more rows, count them or export them.
+   */
+  repeatable: boolean;
 }
 
 export interface SchemaNode {
@@ -187,3 +202,161 @@ export interface StatementSpan {
 }
 
 export type FilePurpose = 'sqlite-open' | 'sqlite-new' | 'certificate' | 'key';
+
+// ---- M2: schema snapshot, editing, history (mirrors src-tauri/src/db/mod.rs) ----
+
+export interface SnapshotTable {
+  /** Schema (PostgreSQL) or database (ClickHouse); empty for SQLite. */
+  schema: string;
+  name: string;
+  kind: 'table' | 'view';
+  columns: { name: string; typeName: string; primaryKey: boolean }[];
+  foreignKeys: { columns: string[]; refSchema: string; refTable: string; refColumns: string[] }[];
+}
+
+export interface SchemaSnapshot {
+  searchPath: string[];
+  tables: SnapshotTable[];
+  functions: { name: string; signature: string }[];
+}
+
+/** Where the rows of an editable result live. */
+export interface EditTarget {
+  schema: string;
+  table: string;
+  /** The table column behind each result column; null for expressions. */
+  columns: (string | null)[];
+  key: string[];
+}
+
+export interface RowEdit {
+  key: (string | null)[];
+  changes: [string, string | null][];
+}
+
+export interface HistoryEntry {
+  id: number;
+  connectionId: string;
+  sql: string;
+  startedAt: number;
+  elapsedMs: number;
+  rows: number | null;
+  error: string | null;
+}
+
+export type ExportFormat = 'csv' | 'tsv' | 'json' | 'ndjson' | 'sql' | 'markdown';
+
+export interface RunOptions {
+  rowLimit: number;
+  confirmed?: boolean;
+  /** Fetch past the result memory cap. */
+  uncapped?: boolean;
+  /** This run repeats a statement to fetch more of its rows. */
+  refetch?: boolean;
+}
+
+// ---- AI copilot ----
+
+export type ProviderKind =
+  | 'openai'
+  | 'anthropic'
+  | 'gemini'
+  | 'deepseek'
+  | 'mistral'
+  | 'xai'
+  | 'openrouter'
+  | 'azure'
+  | 'local'
+  | 'custom';
+
+/** One AI provider. The API key is not here: it lives in the OS keychain. */
+export interface AiProvider {
+  id: string;
+  kind: ProviderKind;
+  name: string;
+  /** Empty = the provider's standard endpoint. */
+  baseUrl: string;
+  /** Azure OpenAI deployment name. */
+  deployment: string;
+  model: string;
+  /** Model for fixes; empty = same as `model`. */
+  fixModel: string;
+}
+
+export type AiTask = 'ask' | 'fix' | 'explain';
+
+export interface AiRequest {
+  id: string;
+  task: AiTask;
+  connectionId: string | null;
+  prompt?: string;
+  sql?: string;
+  error?: string;
+  errorKind?: ErrorKind;
+}
+
+export interface AiPayload {
+  model: string;
+  system: string;
+  messages: { role: 'user' | 'assistant'; content: string }[];
+}
+
+export type AiEvent =
+  | {
+      type: 'context';
+      provider: string;
+      request: AiPayload;
+      tablesSent: number;
+      tablesTotal: number;
+    }
+  | { type: 'delta'; text: string }
+  | { type: 'retry'; reason: string };
+
+export interface AiUsage {
+  inputTokens: number | null;
+  outputTokens: number | null;
+}
+
+export interface AiOutcome {
+  text: string;
+  sql: string | null;
+  explanation: string;
+  /** Why the SQL is destructive, when it is. */
+  destructive: string | null;
+  /** Set when the SQL still does not parse after one retry. */
+  parseError: string | null;
+  usage: AiUsage;
+  provider: string;
+  model: string;
+}
+
+export type AiErrorKind =
+  | 'not-configured'
+  | 'auth'
+  | 'rate-limit'
+  | 'network'
+  | 'timeout'
+  | 'cancelled'
+  | 'refused'
+  | 'other';
+
+export interface AiError {
+  kind: AiErrorKind;
+  message: string;
+}
+
+export interface IndexInfo {
+  tables: number;
+  columns: number;
+  builtAt: number;
+  fingerprint: string;
+  changed: boolean;
+  withSamples: boolean;
+}
+
+export interface UpdateInfo {
+  version: string;
+  /** The release page on GitHub. */
+  url: string;
+  prerelease: boolean;
+}

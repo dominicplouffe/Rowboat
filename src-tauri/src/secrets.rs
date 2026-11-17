@@ -171,6 +171,24 @@ impl Secrets {
         matches!(self.get(connection_id, kind), Ok(Some(_)))
     }
 
+    fn ai_account(provider_id: &str) -> String {
+        format!("ai/{provider_id}/key")
+    }
+
+    pub fn ai_key(&self, provider_id: &str) -> Result<Option<String>, String> {
+        self.backend().get(&Self::ai_account(provider_id))
+    }
+
+    /// Stores an AI provider's API key; an empty one deletes it.
+    pub fn set_ai_key(&self, provider_id: &str, key: &str) -> Result<(), String> {
+        let account = Self::ai_account(provider_id);
+        if key.is_empty() {
+            self.backend().delete(&account)
+        } else {
+            self.backend().set(&account, key)
+        }
+    }
+
     /// Removes every secret of a deleted connection.
     pub fn forget(&self, connection_id: &str) {
         for kind in SecretKind::ALL {

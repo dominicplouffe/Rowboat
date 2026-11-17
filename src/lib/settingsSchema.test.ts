@@ -39,7 +39,13 @@ describe('settings schema', () => {
   it('every editable setting has a field', () => {
     const covered = new Set(FIELDS.map((f) => `${f.section}.${f.key}`));
     // Edited elsewhere: shortcuts in the Keyboard list, onboarding by the wizard.
-    const exempt = new Set(['keyboard.overrides', 'general.onboardingCompleted']);
+    // Providers have their own editor in the AI section.
+    const exempt = new Set([
+      'keyboard.overrides',
+      'general.onboardingCompleted',
+      'ai.providers',
+      'ai.defaultProvider',
+    ]);
     for (const [section, values] of Object.entries(defaults)) {
       if (typeof values !== 'object') continue;
       for (const key of Object.keys(values)) {
@@ -83,7 +89,8 @@ describe('settings schema', () => {
     expect(parseNumberField('-3', 1, 8)).toBe(1);
   });
 
-  it('settings that nothing reads yet say which milestone brings them', () => {
+  it('every setting is acted on: none is left marked as arriving later', () => {
+    expect(FIELDS.filter((f) => f.arrives)).toEqual([]);
     const working = FIELDS.filter((f) => !f.arrives).map((f) => `${f.section}.${f.key}`);
     // Everything else is stored but inert until its milestone, and is shown
     // disabled. Move a key here only when the app really acts on it.
@@ -108,6 +115,27 @@ describe('settings schema', () => {
         'connections.keepaliveSecs',
         'connections.autoReconnect',
         'connections.sshKnownHosts',
+        'general.restoreTabs',
+        'appearance.gridFontFamily',
+        'appearance.gridFontSize',
+        'editor.autocomplete',
+        'editor.formatterKeywordCase',
+        'execution.resultMemoryCapMb',
+        'results.nullText',
+        'results.dateTimeFormat',
+        'results.timeZone',
+        'results.numberFormat',
+        'results.binaryDisplay',
+        'results.maxCellChars',
+        'results.jsonAutoDetect',
+        'general.updateChecks',
+        'general.updateChannel',
+        'ai.autoSuggestFixes',
+        'ai.sendSampleValues',
+        'ai.schemaTokenBudget',
+        'ai.requestTimeoutSecs',
+        'privacy.keepHistory',
+        'privacy.historyRetentionDays',
       ].sort(),
     );
   });

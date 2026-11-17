@@ -16,12 +16,18 @@ use super::{
     hex, quote_ident, quote_literal, Column, ColumnKind, ConnectParams, DbError, DbKind, DbResult,
     ErrorKind, ExecOptions, QueryResult, SchemaNode, Session,
 };
+use super::{ColumnDetails, SchemaDetails, TableDetails};
+use super::{
+    EditTarget, ForeignKey, RowSink, SchemaSnapshot, SnapshotColumn, SnapshotFunction,
+    SnapshotTable,
+};
 use crate::statements::{tx_control, TxControl};
 
 type Reply<T> = oneshot::Sender<DbResult<T>>;
 
 enum Command {
     Execute(String, ExecOptions, Reply<QueryResult>),
+    Export(String, Box<dyn RowSink>, Reply<u64>),
     EndTransaction { commit: bool, reply: Reply<()> },
     Close,
 }
@@ -115,7 +121,7 @@ impl SqliteSession {
     }
 
     async fn query(&self, sql: String) -> DbResult<QueryResult> {
-        self.request(|reply| Command::Execute(sql, ExecOptions { row_limit: 0 }, reply))
+        self.request(|reply| Command::Execute(sql, ExecOptions::limit(0), reply))
             .await
     }
 }
@@ -132,6 +138,9 @@ fn serve(conn: Connection, inbox: mpsc::Receiver<Command>, shared: Arc<Shared>) 
                     r.in_transaction = !conn.is_autocommit();
                     r
                 }));
+            }
+            Command::Export(sql, sink, reply) => {
+                let _ = reply.send(export(&conn, &sql, sink));
             }
             Command::EndTransaction { commit, reply } => {
                 let result = if conn.is_autocommit() {
@@ -184,8 +193,22 @@ fn execute(
             )
         })
         .collect();
+    // Which table column each result column comes from, for inline editing.
+    let origins: Vec<Option<(String, String)>> = stmt
+        .columns_with_metadata()
+        .map(
+            |c| match (c.database_name(), c.table_name(), c.origin_name()) {
+                (Some("main"), Some(table), Some(column)) => {
+                    Some((table.to_string(), column.to_string()))
+                }
+                _ => None,
+            },
+        )
+        .collect();
     let width = declared.len();
     let limit = options.row_limit as usize;
+    let mut bytes = 0u64;
+    let mut stopped_at_memory_cap = false;
     let mut rows_out = Vec::new();
     let mut more = false;
     // Whether every non-NULL value seen in a column was a number.
@@ -224,9 +247,16 @@ fn execute(
                 }
             });
         }
+        bytes += super::row_bytes(&cells);
         rows_out.push(cells);
+        if options.over_memory(bytes) {
+            stopped_at_memory_cap = true;
+            more = true;
+            break;
+        }
     }
     drop(rows);
+    drop(stmt);
 
     let columns = declared
         .into_iter()
@@ -242,8 +272,105 @@ fn execute(
         columns,
         rows: rows_out,
         more_available: more,
+        stopped_at_memory_cap,
+        editable: edit_target(conn, &origins),
         ..Default::default()
     })
+}
+
+/// The table behind a result, if every row can be traced back to one row of
+/// one table: all source columns belong to the same table and its whole
+/// primary key is among them.
+fn edit_target(conn: &Connection, origins: &[Option<(String, String)>]) -> Option<EditTarget> {
+    let table = origins
+        .iter()
+        .flatten()
+        .map(|(table, _)| table)
+        .next()?
+        .clone();
+    if origins.iter().flatten().any(|(t, _)| *t != table) {
+        return None;
+    }
+    let mut stmt = conn
+        .prepare("SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk")
+        .ok()?;
+    let key: Vec<String> = stmt
+        .query_map([&table], |row| row.get(0))
+        .ok()?
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let columns: Vec<Option<String>> = origins
+        .iter()
+        .map(|origin| origin.as_ref().map(|(_, column)| column.clone()))
+        .collect();
+    let has = |name: &String| columns.iter().flatten().any(|c| c == name);
+    if key.is_empty() || !key.iter().all(has) {
+        return None;
+    }
+    Some(EditTarget {
+        schema: String::new(),
+        table,
+        columns,
+        key,
+    })
+}
+
+fn cell_text(value: ValueRef<'_>) -> Option<String> {
+    match value {
+        ValueRef::Null => None,
+        ValueRef::Integer(n) => Some(n.to_string()),
+        ValueRef::Real(f) => Some(format_real(f)),
+        ValueRef::Text(t) => Some(String::from_utf8_lossy(t).into_owned()),
+        ValueRef::Blob(b) => Some(hex(b)),
+    }
+}
+
+/// Steps through the whole result, handing each row to the sink.
+fn export(conn: &Connection, sql: &str, mut sink: Box<dyn RowSink>) -> DbResult<u64> {
+    let io = |e: std::io::Error| DbError::other(format!("Could not write the export: {e}"));
+    let mut stmt = conn.prepare(sql).map_err(|e| map_error(e, Some(sql)))?;
+    let mut columns: Vec<Column> = stmt
+        .columns()
+        .map(|c| {
+            let declared = c.decl_type().unwrap_or("").to_string();
+            Column {
+                name: c.name().to_string(),
+                kind: column_kind(&declared, false),
+                type_name: declared,
+            }
+        })
+        .collect();
+    if columns.is_empty() {
+        return Err(DbError::other("This statement returns no rows to export."));
+    }
+    let width = columns.len();
+    let mut written = 0u64;
+    let mut rows = stmt.raw_query();
+    while let Some(row) = rows.next().map_err(|e| map_error(e, Some(sql)))? {
+        let mut cells = Vec::with_capacity(width);
+        for (i, column) in columns.iter_mut().enumerate() {
+            let value = row.get_ref(i).map_err(|e| map_error(e, Some(sql)))?;
+            // Expressions have no declared type. Rows are streamed, so the
+            // first row decides whether such a column is numeric.
+            if written == 0
+                && column.type_name.is_empty()
+                && matches!(value, ValueRef::Integer(_) | ValueRef::Real(_))
+            {
+                column.kind = ColumnKind::Number;
+            }
+            cells.push(cell_text(value));
+        }
+        if written == 0 {
+            sink.start(&columns).map_err(io)?;
+        }
+        sink.row(&cells).map_err(io)?;
+        written += 1;
+    }
+    if written == 0 {
+        sink.start(&columns).map_err(io)?;
+    }
+    sink.finish().map_err(io)?;
+    Ok(written)
 }
 
 /// SQLite prints REAL with up to 15 significant digits and always shows a
@@ -494,6 +621,168 @@ impl Session for SqliteSession {
         }
     }
 
+    async fn snapshot(&self) -> DbResult<SchemaSnapshot> {
+        let text =
+            |row: &[Option<String>], i: usize| row.get(i).cloned().flatten().unwrap_or_default();
+        let mut tables: Vec<SnapshotTable> = Vec::new();
+
+        let columns = self
+            .query(
+                "SELECT m.name, m.type, p.name, p.type, p.pk \
+                 FROM sqlite_master m, pragma_table_info(m.name) p \
+                 WHERE m.type IN ('table', 'view') AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+                 ORDER BY m.name, p.cid"
+                    .into(),
+            )
+            .await?;
+        for row in &columns.rows {
+            let name = text(row, 0);
+            if tables.last().is_none_or(|t| t.name != name) {
+                tables.push(SnapshotTable {
+                    name,
+                    kind: if text(row, 1) == "view" {
+                        "view"
+                    } else {
+                        "table"
+                    },
+                    ..Default::default()
+                });
+            }
+            tables
+                .last_mut()
+                .expect("just pushed")
+                .columns
+                .push(SnapshotColumn {
+                    name: text(row, 2),
+                    type_name: text(row, 3),
+                    primary_key: text(row, 4) != "0",
+                });
+        }
+
+        let keys = self
+            .query(
+                "SELECT m.name, f.id, f.\"from\", f.\"table\", f.\"to\" \
+                 FROM sqlite_master m, pragma_foreign_key_list(m.name) f \
+                 WHERE m.type = 'table' ORDER BY m.name, f.id, f.seq"
+                    .into(),
+            )
+            .await?;
+        let mut last: Option<(String, String)> = None;
+        for row in &keys.rows {
+            let (table, id) = (text(row, 0), text(row, 1));
+            // A missing "to" column means the referenced table's primary key.
+            let target = match row.get(4).cloned().flatten() {
+                Some(column) => column,
+                None => tables
+                    .iter()
+                    .find(|t| t.name == text(row, 3))
+                    .and_then(|t| t.columns.iter().find(|c| c.primary_key))
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default(),
+            };
+            let Some(owner) = tables.iter_mut().find(|t| t.name == table) else {
+                continue;
+            };
+            if last.as_ref() != Some(&(table.clone(), id.clone())) {
+                owner.foreign_keys.push(ForeignKey {
+                    ref_table: text(row, 3),
+                    ..Default::default()
+                });
+                last = Some((table, id));
+            }
+            let key = owner.foreign_keys.last_mut().expect("just pushed");
+            key.columns.push(text(row, 2));
+            key.ref_columns.push(target);
+        }
+
+        let functions = self
+            .query("SELECT DISTINCT name FROM pragma_function_list ORDER BY name".into())
+            .await?;
+        Ok(SchemaSnapshot {
+            search_path: vec![],
+            tables,
+            functions: functions
+                .rows
+                .iter()
+                .map(|row| SnapshotFunction {
+                    name: text(row, 0),
+                    signature: String::new(),
+                })
+                .collect(),
+        })
+    }
+
+    async fn details(&self, _samples: bool) -> DbResult<SchemaDetails> {
+        let text =
+            |row: &[Option<String>], i: usize| row.get(i).cloned().flatten().unwrap_or_default();
+        let mut details = SchemaDetails {
+            server_version: self
+                .query("SELECT sqlite_version()".into())
+                .await?
+                .rows
+                .first()
+                .map(|row| text(row, 0))
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        let columns = self
+            .query(
+                "SELECT m.name, p.name, p.\"notnull\", p.pk \
+                 FROM sqlite_master m, pragma_table_info(m.name) p \
+                 WHERE m.type IN ('table', 'view') AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+                 ORDER BY m.name, p.cid"
+                    .into(),
+            )
+            .await?;
+        for row in &columns.rows {
+            let name = text(row, 0);
+            if details.tables.last().is_none_or(|t| t.name != name) {
+                details.tables.push(TableDetails {
+                    name,
+                    ..Default::default()
+                });
+            }
+            details
+                .tables
+                .last_mut()
+                .expect("just pushed")
+                .columns
+                .push(ColumnDetails {
+                    name: text(row, 1),
+                    nullable: text(row, 2) == "0" && text(row, 3) == "0",
+                    ..Default::default()
+                });
+        }
+        let indexes = self
+            .query(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL ORDER BY name"
+                    .into(),
+            )
+            .await?;
+        for row in &indexes.rows {
+            let table = text(row, 0);
+            let sql = text(row, 1);
+            if let Some(owner) = details.tables.iter_mut().find(|t| t.name == table) {
+                // "CREATE UNIQUE INDEX x ON t (a, b)" → "unique (a, b)"
+                let unique = if sql.to_ascii_uppercase().contains("UNIQUE") {
+                    "unique "
+                } else {
+                    ""
+                };
+                if let Some(open) = sql.find('(') {
+                    owner.indexes.push(format!("{unique}{}", &sql[open..]));
+                }
+            }
+        }
+        Ok(details)
+    }
+
+    async fn export(&self, sql: &str, sink: Box<dyn RowSink>) -> DbResult<u64> {
+        let sql = sql.to_string();
+        self.request(|reply| Command::Export(sql, sink, reply))
+            .await
+    }
+
     async fn close(&self) {
         let _ = self.commands.send(Command::Close);
     }
@@ -532,7 +821,7 @@ mod tests {
         (dir, session)
     }
 
-    const ALL: ExecOptions = ExecOptions { row_limit: 0 };
+    const ALL: ExecOptions = ExecOptions::limit(0);
 
     async fn seed(session: &SqliteSession, rows: u32) {
         session
@@ -588,14 +877,14 @@ mod tests {
         let (_dir, s) = open().await;
         seed(&s, 50).await;
         let r = s
-            .execute("SELECT * FROM t", ExecOptions { row_limit: 10 })
+            .execute("SELECT * FROM t", ExecOptions::limit(10))
             .await
             .unwrap();
         assert_eq!(r.rows.len(), 10);
         assert!(r.more_available);
 
         let exact = s
-            .execute("SELECT * FROM t", ExecOptions { row_limit: 50 })
+            .execute("SELECT * FROM t", ExecOptions::limit(50))
             .await
             .unwrap();
         assert_eq!(exact.rows.len(), 50);
@@ -608,10 +897,7 @@ mod tests {
         // 10 million rows if fully stepped; must come back at once.
         let sql = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10000000) SELECT i FROM n";
         let started = std::time::Instant::now();
-        let r = s
-            .execute(sql, ExecOptions { row_limit: 1000 })
-            .await
-            .unwrap();
+        let r = s.execute(sql, ExecOptions::limit(1000)).await.unwrap();
         assert_eq!(r.rows.len(), 1000);
         assert!(r.more_available);
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -750,6 +1036,167 @@ mod tests {
             SqliteSession::connect(not_db).await.err().unwrap().kind,
             ErrorKind::Connection
         );
+    }
+
+    #[tokio::test]
+    async fn fetching_stops_at_the_memory_cap() {
+        let (_dir, s) = open().await;
+        seed(&s, 5000).await;
+        let capped = ExecOptions {
+            row_limit: 0,
+            max_bytes: 20_000,
+        };
+        let r = s.execute("SELECT * FROM t", capped).await.unwrap();
+        assert!(r.stopped_at_memory_cap && r.more_available);
+        assert!(r.rows.len() < 5000 && r.rows.len() > 50, "{}", r.rows.len());
+        let all = s.execute("SELECT * FROM t", ALL).await.unwrap();
+        assert!(!all.stopped_at_memory_cap);
+        assert_eq!(all.rows.len(), 5000);
+    }
+
+    #[tokio::test]
+    async fn results_from_one_table_with_its_key_are_editable() {
+        let (_dir, s) = open().await;
+        seed(&s, 2).await;
+        s.execute(
+            "CREATE TABLE pair (a INT, b INT, v TEXT, PRIMARY KEY (a, b))",
+            ALL,
+        )
+        .await
+        .unwrap();
+        s.execute("CREATE TABLE nokey (v TEXT)", ALL).await.unwrap();
+
+        let target = s
+            .execute("SELECT name, id, score * 2 AS doubled FROM t", ALL)
+            .await
+            .unwrap()
+            .editable
+            .unwrap();
+        assert_eq!(target.table, "t");
+        assert_eq!(target.key, ["id"]);
+        assert_eq!(
+            target.columns,
+            [Some("name".into()), Some("id".into()), None]
+        );
+
+        let composite = s
+            .execute("SELECT * FROM pair", ALL)
+            .await
+            .unwrap()
+            .editable
+            .unwrap();
+        assert_eq!(composite.key, ["a", "b"]);
+
+        // Not editable: key missing, a join, no primary key, or no table at all.
+        for sql in [
+            "SELECT name FROM t",
+            "SELECT t.id, pair.a FROM t, pair",
+            "SELECT * FROM nokey",
+            "SELECT 1",
+            "SELECT a FROM pair",
+        ] {
+            assert_eq!(s.execute(sql, ALL).await.unwrap().editable, None, "{sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn export_streams_every_row_to_the_sink() {
+        let (_dir, s) = open().await;
+        seed(&s, 2500).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.csv");
+        let writer = crate::export::Writer::new(
+            std::io::BufWriter::new(std::fs::File::create(&path).unwrap()),
+            crate::export::Options {
+                format: crate::export::Format::Csv,
+                kind: DbKind::Sqlite,
+                table: "t".into(),
+            },
+        );
+        let written = s
+            .export("SELECT id, name FROM t ORDER BY id", Box::new(writer))
+            .await
+            .unwrap();
+        assert_eq!(written, 2500);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2501);
+        assert_eq!(
+            (lines[0], lines[1], lines[2500]),
+            ("id,name", "1,row 1", "2500,row 2500")
+        );
+
+        let error = s
+            .export(
+                "CREATE TABLE z (a)",
+                Box::new(crate::export::Writer::new(
+                    Vec::new(),
+                    crate::export::Options {
+                        format: crate::export::Format::Csv,
+                        kind: DbKind::Sqlite,
+                        table: "t".into(),
+                    },
+                )),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("no rows"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_describes_tables_keys_and_functions() {
+        let (_dir, s) = open().await;
+        s.execute(
+            "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)",
+            ALL,
+        )
+        .await
+        .unwrap();
+        s.execute(
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER REFERENCES customers (id), \
+             shipped_to INTEGER REFERENCES customers, total REAL)",
+            ALL,
+        )
+        .await
+        .unwrap();
+        s.execute(
+            "CREATE VIEW big AS SELECT id FROM orders WHERE total > 100",
+            ALL,
+        )
+        .await
+        .unwrap();
+
+        let snapshot = s.snapshot().await.unwrap();
+        let names: Vec<_> = snapshot
+            .tables
+            .iter()
+            .map(|t| (t.name.as_str(), t.kind))
+            .collect();
+        assert_eq!(
+            names,
+            [("big", "view"), ("customers", "table"), ("orders", "table")]
+        );
+        let orders = &snapshot.tables[2];
+        assert_eq!(orders.columns.len(), 4);
+        assert!(orders.columns[0].primary_key && !orders.columns[1].primary_key);
+        assert_eq!(orders.foreign_keys.len(), 2);
+        let explicit = orders
+            .foreign_keys
+            .iter()
+            .find(|k| k.columns == ["customer_id"])
+            .unwrap();
+        assert_eq!(
+            (explicit.ref_table.as_str(), explicit.ref_columns.clone()),
+            ("customers", vec!["id".to_string()])
+        );
+        // "REFERENCES customers" with no column means its primary key.
+        let implicit = orders
+            .foreign_keys
+            .iter()
+            .find(|k| k.columns == ["shipped_to"])
+            .unwrap();
+        assert_eq!(implicit.ref_columns, ["id"]);
+        assert!(snapshot.functions.iter().any(|f| f.name == "length"));
     }
 
     #[tokio::test]

@@ -4,7 +4,9 @@
   import { connections } from '../lib/connections.svelte';
   import { editorBridge } from '../lib/editorBridge';
   import { reportReady } from '../lib/ready';
+  import { complete } from '../lib/complete';
   import { errorOffset } from '../lib/runner';
+  import { schemaCache } from '../lib/schemaCache.svelte';
   import { settings } from '../lib/settings.svelte';
   import { tabs } from '../lib/tabs.svelte';
 
@@ -20,6 +22,7 @@
     return {
       ...base,
       readOnly: tab?.generated ?? false,
+      completeOnTyping: base.autocomplete === 'typing',
       dialect: connections.byId(tab?.connectionId)?.kind ?? null,
     };
   }
@@ -30,10 +33,22 @@
     import('../editor/sqlEditor')
       .then(({ SqlEditor }) => {
         if (destroyed || !settings.value) return;
-        editor = new SqlEditor(host, options()!, (tabId, text) => {
-          const tab = tabs.list.find((t) => t.id === tabId);
-          if (tab) tab.text = text;
-        });
+        editor = new SqlEditor(
+          host,
+          options()!,
+          (tabId, text) => {
+            const tab = tabs.list.find((t) => t.id === tabId);
+            if (tab) tab.text = text;
+          },
+          {
+            // Served from the in-memory schema index: no database round trip.
+            complete: (text, cursor) => {
+              const index = schemaCache.get(tabs.active?.connectionId);
+              return index ? complete(index, text, cursor, { usage: schemaCache.usage }) : null;
+            },
+            accepted: (usageKey) => schemaCache.used(usageKey),
+          },
+        );
         editorBridge.attach(editor);
       })
       .catch(() => (failed = true))
@@ -62,6 +77,12 @@
   $effect(() => {
     const current = options();
     if (editor && current) editor.configure(current);
+  });
+
+  // Keep the schema index for the active tab's connection loaded.
+  $effect(() => {
+    const connection = connections.byId(tabs.active?.connectionId);
+    if (connection?.connected) void schemaCache.ensure(connection.id, connection.kind);
   });
 
   // Underline where the database says the error is.

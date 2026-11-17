@@ -2,10 +2,17 @@
 // tests. Never part of a production bundle (see ipc.ts).
 
 import type {
+  AiEvent,
+  AiOutcome,
+  AiProvider,
+  AiRequest,
   AppInfo,
   ConnectionConfig,
   ConnectionView,
   DbError,
+  HistoryEntry,
+  RunOptions,
+  SchemaSnapshot,
   RunResult,
   SchemaNode,
   SecretInput,
@@ -64,6 +71,8 @@ export function defaultSettings(): Settings {
       sshKnownHosts: 'ask',
     },
     ai: {
+      providers: [],
+      defaultProvider: '',
       autoSuggestFixes: true,
       sendSampleValues: false,
       schemaTokenBudget: 4000,
@@ -116,6 +125,47 @@ const withPassword = new Set<string>();
 const open = new Set<string>();
 const cancelled = new Set<string>();
 const manualCommit = new Set<string>();
+const history: HistoryEntry[] = [];
+let savedSession: string | null = null;
+
+const SNAPSHOT: SchemaSnapshot = {
+  searchPath: ['public'],
+  tables: [
+    {
+      schema: 'public',
+      name: 'customers',
+      kind: 'table',
+      columns: [
+        { name: 'id', typeName: 'integer', primaryKey: true },
+        { name: 'name', typeName: 'text', primaryKey: false },
+      ],
+      foreignKeys: [],
+    },
+    {
+      schema: 'public',
+      name: 'orders',
+      kind: 'table',
+      columns: [
+        { name: 'id', typeName: 'integer', primaryKey: true },
+        { name: 'customer_id', typeName: 'integer', primaryKey: false },
+        { name: 'total', typeName: 'numeric(10,2)', primaryKey: false },
+        { name: 'created_at', typeName: 'timestamp with time zone', primaryKey: false },
+      ],
+      foreignKeys: [
+        {
+          columns: ['customer_id'],
+          refSchema: 'public',
+          refTable: 'customers',
+          refColumns: ['id'],
+        },
+      ],
+    },
+  ],
+  functions: [
+    { name: 'count', signature: '(*)' },
+    { name: 'lower', signature: '(text)' },
+  ],
+};
 let nextId = 1;
 
 function fail(kind: DbError['kind'], message: string, extra: Partial<DbError> = {}): DbError {
@@ -217,6 +267,41 @@ async function fakeDatabase<T>(command: string, args: Record<string, unknown>): 
     case 'transaction_end':
     case 'pick_file':
       return (command === 'pick_file' ? null : undefined) as T;
+    case 'schema_snapshot':
+      return SNAPSHOT as T;
+    case 'query_count':
+      return 5000 as T;
+    case 'export_query':
+    case 'export_page':
+    case 'sql_file_open':
+    case 'sql_file_save':
+      return null as T;
+    case 'format_rows':
+      return (args.rows as (string | null)[][]).map((row) => row.join('\t')).join('\n') as T;
+    case 'edits_preview':
+      return (args.edits as { key: string[]; changes: [string, string | null][] }[]).map(
+        (edit) =>
+          `UPDATE orders SET ${edit.changes
+            .map(([c, v]) => `${c} = ${v === null ? 'NULL' : `'${v}'`}`)
+            .join(', ')} WHERE id = '${edit.key[0]}'`,
+      ) as T;
+    case 'edits_apply':
+      return (args.edits as unknown[]).length as T;
+    case 'history_search': {
+      const words = (args.search as string).toLowerCase().split(/\s+/).filter(Boolean);
+      return history
+        .filter((h) => !args.connectionId || h.connectionId === args.connectionId)
+        .filter((h) => words.every((w) => h.sql.toLowerCase().includes(w)))
+        .slice(0, args.limit as number) as T;
+    }
+    case 'history_clear':
+      history.length = 0;
+      return undefined as T;
+    case 'session_save':
+      savedSession = args.value as string;
+      return undefined as T;
+    case 'session_load':
+      return savedSession as T;
     case 'schema_children':
       return (TREE[(args.path as string[]).join('/')] ?? []) as T;
     case 'schema_ddl':
@@ -226,10 +311,20 @@ async function fakeDatabase<T>(command: string, args: Record<string, unknown>): 
       const config = connections.get(args.connectionId as string);
       if (!config || !open.has(config.id)) throw fail('connection', 'This connection is not open.');
       const lower = sql.toLowerCase();
+      const options = args.options as RunOptions;
+      history.unshift({
+        id: history.length + 1,
+        connectionId: config.id,
+        sql,
+        startedAt: Date.now(),
+        elapsedMs: 12,
+        rows: null,
+        error: null,
+      });
       if (
         config.environment === 'prod' &&
         /^(drop|truncate|alter)\b/.test(lower) &&
-        !args.confirmed
+        !options.confirmed
       ) {
         throw fail('needs-confirmation', 'DROP removes objects permanently.');
       }
@@ -260,12 +355,22 @@ async function fakeDatabase<T>(command: string, args: Record<string, unknown>): 
         raw: null,
         notices: [],
         inTransaction: false,
+        stoppedAtMemoryCap: false,
+        editable: null,
         elapsedMs: 12,
+        repeatable:
+          /^(select|with|show|explain|values)\b/.test(lower) && !/\breturning\b/.test(lower),
       };
-      if (!/^(select|with|show|explain|values)\b/.test(lower)) {
+      if (options.refetch && !base.repeatable) {
+        throw fail(
+          'other',
+          'This statement changes data, so Rowboat will not run it a second time.',
+        );
+      }
+      if (!/^(select|with|show|explain|values)\b/.test(lower) && !/\breturning\b/.test(lower)) {
         return { ...base, rowsAffected: 1 } as T;
       }
-      const limit = (args.rowLimit as number) || 5000;
+      const limit = options.rowLimit || 5000;
       const total = 5000;
       const count = Math.min(limit, total);
       return {
@@ -285,9 +390,178 @@ async function fakeDatabase<T>(command: string, args: Record<string, unknown>): 
           `2026-11-${String((i % 28) + 1).padStart(2, '0')} 10:00:00+00`,
         ]),
         moreAvailable: count < total,
+        editable: lower.includes('join')
+          ? null
+          : {
+              schema: 'public',
+              table: 'orders',
+              columns: ['id', 'name', 'total', 'note', 'created_at'],
+              key: ['id'],
+            },
       } as T;
     }
+    case 'update_check':
+      // The fake "newer release" exists only on the beta channel.
+      if (current.general.updateChecks === 'off' && !args.manual) return null as T;
+      return (
+        current.general.updateChannel === 'beta'
+          ? {
+              version: '0.2.0-beta.1',
+              url: 'https://github.com/dominicplouffe/Rowboat/releases/tag/v0.2.0-beta.1',
+              prerelease: true,
+            }
+          : null
+      ) as T;
+    case 'update_open':
+      return undefined as T;
+    case 'ai_key_set':
+      if (args.key) aiKeys.add(args.providerId as string);
+      else aiKeys.delete(args.providerId as string);
+      return undefined as T;
+    case 'ai_key_status':
+      return Object.fromEntries(current.ai.providers.map((p) => [p.id, aiKeys.has(p.id)])) as T;
+    case 'ai_models': {
+      const provider = args.provider as AiProvider;
+      requireKey(provider);
+      return [`${provider.kind}-large`, `${provider.kind}-small`] as T;
+    }
+    case 'ai_test':
+      requireKey(args.provider as AiProvider);
+      return 'OK' as T;
+    case 'ai_cancel':
+      cancelled.add(args.id as string);
+      return undefined as T;
+    case 'ai_index':
+      return {
+        tables: 2,
+        columns: 6,
+        builtAt: Date.now(),
+        fingerprint: 'fake',
+        changed: Boolean(args.refresh),
+        withSamples: false,
+      } as T;
+    case 'sample_database': {
+      const existing = [...connections.values()].find((c) => c.name === 'Sample shop');
+      if (existing) return view(existing) as T;
+      const config: ConnectionConfig = {
+        id: `fake-${nextId++}`,
+        name: 'Sample shop',
+        kind: 'sqlite',
+        folder: '',
+        color: '',
+        environment: 'none',
+        readOnly: false,
+        host: '',
+        port: 0,
+        database: '',
+        user: '',
+        usePgpass: false,
+        tls: { mode: 'disable', caCertPath: '', clientCertPath: '', clientKeyPath: '' },
+        ssh: { enabled: false, host: '', port: 22, user: '', auth: 'agent', keyPath: '' },
+        path: '(in memory)/sample.db',
+        create: false,
+        aiEnabled: true,
+        aiSampleValues: false,
+      };
+      connections.set(config.id, config);
+      return view(config) as T;
+    }
+    case 'ai_run':
+      return fakeCopilot(
+        args.request as AiRequest,
+        args.onEvent as (event: AiEvent) => void,
+      ) as Promise<T>;
     default:
       throw new Error(`unknown command: ${command}`);
   }
+}
+
+// ---- A pretend AI provider ----
+
+const aiKeys = new Set<string>();
+
+function aiFail(kind: string, message: string): { kind: string; message: string } {
+  return { kind, message };
+}
+
+function requireKey(provider: AiProvider): void {
+  if (!['local', 'custom'].includes(provider.kind) && !aiKeys.has(provider.id)) {
+    throw aiFail('not-configured', `No API key is saved for ${provider.name || provider.kind}.`);
+  }
+}
+
+async function fakeCopilot(
+  request: AiRequest,
+  onEvent: (event: AiEvent) => void,
+): Promise<AiOutcome> {
+  const provider = current.ai.providers.find((p) => p.id === current.ai.defaultProvider);
+  if (!provider) {
+    throw aiFail('not-configured', 'No AI provider is set up. Add one in Settings → AI.');
+  }
+  requireKey(provider);
+  const connection = request.connectionId ? connections.get(request.connectionId) : undefined;
+  if (connection && connection.aiEnabled === false) {
+    throw aiFail('not-configured', `AI is turned off for the connection "${connection.name}".`);
+  }
+  if (request.task === 'fix' && !['syntax', 'schema'].includes(request.errorKind ?? '')) {
+    throw aiFail('other', 'Only syntax and schema errors are sent to the AI.');
+  }
+  const model =
+    request.task === 'fix' && provider.fixModel ? provider.fixModel : provider.model || 'fake';
+  const user =
+    request.task === 'fix'
+      ? `This statement failed:\n${request.sql}\n\nThe database said:\n${request.error}`
+      : request.task === 'explain'
+        ? (request.sql ?? '')
+        : (request.prompt ?? '');
+  onEvent({
+    type: 'context',
+    provider: provider.name || provider.kind,
+    request: {
+      model,
+      system:
+        'You are the SQL copilot inside Rowboat.\n\n<schema>\ncustomers(id int pk, name text)\norders(id int pk, customer_id int fk→customers.id, total numeric, created_at timestamptz)\n</schema>',
+      messages: [{ role: 'user', content: user }],
+    },
+    tablesSent: 2,
+    tablesTotal: 2,
+  });
+
+  const prompt = (request.prompt ?? '').toLowerCase();
+  let sql: string | null = null;
+  let explanation: string;
+  if (request.task === 'explain') {
+    explanation = 'Returns every row of the query, newest first. Nothing is changed.';
+  } else if (request.task === 'fix') {
+    sql = (request.sql ?? '').replace(/fromm/gi, 'FROM');
+    explanation = 'FROM was misspelled.';
+  } else if (prompt.includes('delete')) {
+    sql = 'DELETE FROM orders\nWHERE total = 0;';
+    explanation = 'Removes orders with a zero total.';
+  } else if (prompt.includes('nothing')) {
+    explanation = 'There is no table for that in this schema.';
+  } else {
+    sql =
+      'SELECT c.name, sum(o.total) AS revenue\nFROM orders o\nJOIN customers c ON c.id = o.customer_id\nGROUP BY c.name\nORDER BY revenue DESC;';
+    explanation = 'Total order value per customer, highest first.';
+  }
+  const text = sql ? `\`\`\`sql\n${sql}\n\`\`\`\n${explanation}` : explanation;
+  // Stream in a few pieces so the UI's streaming path is exercised.
+  const slow = prompt.includes('slow');
+  for (let i = 0; i < text.length; i += 24) {
+    if (cancelled.delete(request.id)) throw aiFail('cancelled', 'Cancelled.');
+    await new Promise((r) => setTimeout(r, slow ? 150 : 1));
+    onEvent({ type: 'delta', text: text.slice(i, i + 24) });
+  }
+  if (cancelled.delete(request.id)) throw aiFail('cancelled', 'Cancelled.');
+  return {
+    text,
+    sql,
+    explanation,
+    destructive: sql?.startsWith('DELETE') ? 'DELETE removes rows.' : null,
+    parseError: null,
+    usage: { inputTokens: 180, outputTokens: 42 },
+    provider: provider.name || provider.kind,
+    model,
+  };
 }

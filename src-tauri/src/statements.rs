@@ -14,7 +14,7 @@ use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 
 use crate::db::DbKind;
 
-fn dialect(kind: DbKind) -> Box<dyn Dialect> {
+pub(crate) fn dialect(kind: DbKind) -> Box<dyn Dialect> {
     match kind {
         DbKind::Postgres => Box::new(PostgreSqlDialect {}),
         DbKind::Clickhouse => Box::new(ClickHouseDialect {}),
@@ -221,6 +221,34 @@ pub fn tx_control(kind: DbKind, sql: &str) -> TxControl {
         ("ROLLBACK" | "ABORT", "TO" | "PREPARED") => TxControl::None,
         ("ROLLBACK" | "ABORT", _) => TxControl::Rollback,
         _ => TxControl::None,
+    }
+}
+
+/// Whether running the statement a second time is harmless: a plain read.
+///
+/// "Fetch next page", "Fetch all", "Count rows" and a full export all run the
+/// statement again, which must never happen to one that changes data
+/// (`UPDATE … RETURNING`, a data-modifying CTE, `SELECT … INTO`,
+/// `EXPLAIN ANALYZE`). When in doubt the answer is no.
+pub fn repeatable(kind: DbKind, sql: &str) -> bool {
+    let Some(tokens) = tokenize(kind, sql) else {
+        return false;
+    };
+    let words: Vec<String> = tokens
+        .iter()
+        .filter_map(|t| match &t.token {
+            Token::Word(w) if w.quote_style.is_none() => Some(w.value.to_ascii_uppercase()),
+            _ => None,
+        })
+        .collect();
+    let has = |names: &[&str]| words.iter().any(|w| names.contains(&w.as_str()));
+    match words.first().map(String::as_str) {
+        Some("SELECT" | "WITH" | "VALUES" | "TABLE") => {
+            !has(&["INSERT", "UPDATE", "DELETE", "MERGE", "INTO"])
+        }
+        Some("SHOW" | "DESCRIBE" | "DESC") => true,
+        Some("EXPLAIN") => !has(&["ANALYZE", "ANALYSE"]),
+        _ => false,
     }
 }
 
@@ -491,6 +519,36 @@ mod tests {
             "select * from t where id in (select id from deleted)",
         ] {
             assert_eq!(destructive_reason(Postgres, sql), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn only_plain_reads_may_be_run_again() {
+        let pg = DbKind::Postgres;
+        for sql in [
+            "SELECT * FROM orders",
+            "  -- note\n select 1",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "VALUES (1), (2)",
+            "SHOW server_version",
+            "EXPLAIN SELECT 1",
+            "SELECT \"update\", 'delete into' FROM t",
+        ] {
+            assert!(repeatable(pg, sql), "{sql}");
+        }
+        for sql in [
+            "UPDATE t SET n = n + 1 RETURNING *",
+            "INSERT INTO t VALUES (1) RETURNING id",
+            "DELETE FROM t RETURNING *",
+            "WITH gone AS (DELETE FROM t RETURNING *) SELECT * FROM gone",
+            "SELECT * INTO copy FROM t",
+            "EXPLAIN ANALYZE DELETE FROM t",
+            "EXPLAIN (ANALYZE, BUFFERS) SELECT 1",
+            "CALL refresh_totals()",
+            "PRAGMA journal_mode = WAL",
+            "SELECT 'unterminated",
+        ] {
+            assert!(!repeatable(pg, sql), "{sql}");
         }
     }
 }

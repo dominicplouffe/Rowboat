@@ -26,6 +26,8 @@ use super::{
     quote_ident, quote_literal, ConnectParams, DbError, DbKind, DbResult, ErrorKind, ExecOptions,
     QueryResult, SchemaNode, Session,
 };
+use super::{ColumnDetails, SchemaDetails, TableDetails};
+use super::{RowSink, SchemaSnapshot, SnapshotColumn, SnapshotFunction, SnapshotTable};
 use crate::connections::TlsMode;
 
 const FORMAT: &str = "RowBinaryWithNamesAndTypes";
@@ -290,16 +292,13 @@ impl ChSession {
         &self,
         sql: &str,
         query_id: &str,
-        row_limit: u32,
+        options: ExecOptions,
         stateful: bool,
     ) -> DbResult<QueryResult> {
         let mut lock_retries = 0;
         loop {
             let level = self.settings_level.load(Ordering::SeqCst);
-            match self
-                .run_once(sql, query_id, row_limit, level, stateful)
-                .await
-            {
+            match self.run_once(sql, query_id, options, level, stateful).await {
                 Ok(result) => {
                     if stateful {
                         self.session_has_database.store(true, Ordering::SeqCst);
@@ -335,10 +334,11 @@ impl ChSession {
         &self,
         sql: &str,
         query_id: &str,
-        row_limit: u32,
+        options: ExecOptions,
         level: u8,
         stateful: bool,
     ) -> DbResult<QueryResult> {
+        let row_limit = options.row_limit;
         let response = self
             .request(sql, query_id, row_limit, level, stateful)
             .send()
@@ -401,10 +401,16 @@ impl ChSession {
         let mut decoder = Decoder::new();
         // Rows still wanted, plus one to learn whether more exist.
         let want = |have: usize| if limit == 0 { 0 } else { limit + 1 - have };
-        let over_limit = |result: &mut QueryResult, rows: Vec<Vec<Option<String>>>| {
+        let mut bytes = 0u64;
+        let mut over_limit = |result: &mut QueryResult, rows: Vec<Vec<Option<String>>>| {
+            bytes += rows.iter().map(|row| super::row_bytes(row)).sum::<u64>();
             result.rows.extend(rows);
             if limit > 0 && result.rows.len() > limit {
                 result.rows.truncate(limit);
+                result.more_available = true;
+            } else if options.over_memory(bytes) {
+                // The result memory cap: stop here and say so.
+                result.stopped_at_memory_cap = true;
                 result.more_available = true;
             }
             result.more_available
@@ -430,6 +436,11 @@ impl ChSession {
             if let Some(text) = decoder.exception() {
                 return Err(parse_exception(&text, None));
             }
+            // The cap may have been crossed by the very last rows.
+            if result.stopped_at_memory_cap {
+                result.stopped_at_memory_cap = false;
+                result.more_available = false;
+            }
             if !result.more_available && !decoder.pending().is_empty() {
                 return Err(DbError::other(
                     "The server's response ended in the middle of a row.",
@@ -446,7 +457,7 @@ impl ChSession {
     /// A stateless request outside the user's session, for the navigator.
     async fn internal(&self, sql: &str) -> DbResult<QueryResult> {
         let id = uuid::Uuid::new_v4().to_string();
-        self.run(sql, &id, 0, false).await
+        self.run(sql, &id, ExecOptions::limit(0), false).await
     }
 }
 
@@ -477,7 +488,7 @@ impl Session for ChSession {
         let query_id = uuid::Uuid::new_v4().to_string();
         *self.running.lock().unwrap_or_else(|e| e.into_inner()) = Some(query_id.clone());
         let result = tokio::select! {
-            result = self.run(sql, &query_id, options.row_limit, true) => result,
+            result = self.run(sql, &query_id, options, true) => result,
             () = self.cancelled.notified() => Err(DbError::cancelled()),
         };
         *self.running.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -622,6 +633,243 @@ impl Session for ChSession {
             .map(|row| cell(row, 0))
             .unwrap_or_default();
         Ok(format!("{};", statement.trim_end()))
+    }
+
+    async fn snapshot(&self) -> DbResult<SchemaSnapshot> {
+        const USER_DATABASES: &str =
+            "database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')";
+        let views: std::collections::HashSet<(String, String)> = self
+            .internal(&format!(
+                "SELECT database, name FROM system.tables WHERE engine LIKE '%View' AND {USER_DATABASES}"
+            ))
+            .await?
+            .rows
+            .iter()
+            .map(|row| (cell(row, 0), cell(row, 1)))
+            .collect();
+
+        let mut tables: Vec<SnapshotTable> = Vec::new();
+        let columns = self
+            .internal(&format!(
+                "SELECT database, table, name, type, is_in_primary_key FROM system.columns \
+                 WHERE {USER_DATABASES} ORDER BY database, table, position"
+            ))
+            .await?;
+        for row in &columns.rows {
+            let (schema, name) = (cell(row, 0), cell(row, 1));
+            if tables
+                .last()
+                .is_none_or(|t| t.schema != schema || t.name != name)
+            {
+                let kind = if views.contains(&(schema.clone(), name.clone())) {
+                    "view"
+                } else {
+                    "table"
+                };
+                tables.push(SnapshotTable {
+                    schema,
+                    name,
+                    kind,
+                    ..Default::default()
+                });
+            }
+            tables
+                .last_mut()
+                .expect("just pushed")
+                .columns
+                .push(SnapshotColumn {
+                    name: cell(row, 2),
+                    type_name: cell(row, 3),
+                    primary_key: cell(row, 4) == "1",
+                });
+        }
+
+        // `syntax` holds the argument hint on recent servers; older ones lack the column.
+        let functions = match self
+            .internal("SELECT name, syntax FROM system.functions ORDER BY name")
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                self.internal("SELECT name, '' FROM system.functions ORDER BY name")
+                    .await?
+            }
+        };
+        Ok(SchemaSnapshot {
+            search_path: vec![if self.database.is_empty() {
+                "default".into()
+            } else {
+                self.database.clone()
+            }],
+            tables,
+            functions: functions
+                .rows
+                .iter()
+                .map(|row| {
+                    let (name, syntax) = (cell(row, 0), cell(row, 1));
+                    // "name(args)" → "(args)"
+                    let signature = syntax
+                        .find('(')
+                        .map(|open| syntax[open..].trim().to_string())
+                        .unwrap_or_default();
+                    SnapshotFunction { name, signature }
+                })
+                .collect(),
+        })
+    }
+
+    async fn details(&self, _samples: bool) -> DbResult<SchemaDetails> {
+        const USER_DATABASES: &str =
+            "database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')";
+        let mut details = SchemaDetails {
+            server_version: self
+                .internal("SELECT version()")
+                .await?
+                .rows
+                .first()
+                .map(|row| cell(row, 0))
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        let tables = self
+            .internal(&format!(
+                "SELECT database, name, engine, sorting_key, partition_key, toString(total_rows), comment \
+                 FROM system.tables WHERE {USER_DATABASES} ORDER BY database, name"
+            ))
+            .await?;
+        for row in &tables.rows {
+            let mut storage = cell(row, 2);
+            if !cell(row, 3).is_empty() {
+                storage.push_str(&format!(" ORDER BY ({})", cell(row, 3)));
+            }
+            if !cell(row, 4).is_empty() {
+                storage.push_str(&format!(" PARTITION BY {}", cell(row, 4)));
+            }
+            details.tables.push(TableDetails {
+                schema: cell(row, 0),
+                name: cell(row, 1),
+                storage,
+                row_estimate: cell(row, 5).parse().ok(),
+                comment: cell(row, 6),
+                ..Default::default()
+            });
+        }
+        let columns = self
+            .internal(&format!(
+                "SELECT database, table, name, type, comment FROM system.columns \
+                 WHERE {USER_DATABASES} ORDER BY database, table, position"
+            ))
+            .await?;
+        for row in &columns.rows {
+            let (schema, name) = (cell(row, 0), cell(row, 1));
+            if let Some(owner) = details
+                .tables
+                .iter_mut()
+                .find(|t| t.schema == schema && t.name == name)
+            {
+                owner.columns.push(ColumnDetails {
+                    name: cell(row, 2),
+                    nullable: cell(row, 3).contains("Nullable("),
+                    comment: cell(row, 4),
+                    values: Vec::new(),
+                });
+            }
+        }
+        Ok(details)
+    }
+
+    async fn export(&self, sql: &str, mut sink: Box<dyn RowSink>) -> DbResult<u64> {
+        let io = |e: std::io::Error| DbError::other(format!("Could not write the export: {e}"));
+        let _turn = self.gate.lock().await;
+        let query_id = uuid::Uuid::new_v4().to_string();
+        *self.running.lock().unwrap_or_else(|e| e.into_inner()) = Some(query_id.clone());
+
+        let work = async {
+            // Same settings as a normal run, minus the row limit.
+            let mut level = self.settings_level.load(Ordering::SeqCst);
+            let response = loop {
+                let response = self
+                    .request(sql, &query_id, 0, level, true)
+                    .send()
+                    .await
+                    .map_err(transport_error)?;
+                if response.status().is_success() {
+                    break response;
+                }
+                let code = response
+                    .headers()
+                    .get("X-ClickHouse-Exception-Code")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let error =
+                    parse_exception(&response.text().await.unwrap_or_default(), code.as_deref());
+                let refused_settings = error.code.as_deref() == Some("164")
+                    && error.message.to_lowercase().contains("setting")
+                    && level < SETTINGS_NONE;
+                if !refused_settings {
+                    return Err(error);
+                }
+                level = if level == SETTINGS_ALL && self.read_only {
+                    SETTINGS_READONLY_ONLY
+                } else {
+                    SETTINGS_NONE
+                };
+                self.settings_level.store(level, Ordering::SeqCst);
+            };
+            let format = response
+                .headers()
+                .get("X-ClickHouse-Format")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            if format.as_deref().is_some_and(|f| f != FORMAT) {
+                return Err(DbError::other(
+                    "Remove the FORMAT clause to export: Rowboat writes the file format itself.",
+                ));
+            }
+
+            let mut stream = response.bytes_stream();
+            let mut decoder = Decoder::new();
+            let mut started = false;
+            let mut written = 0u64;
+            let mut flush = |decoder: &Decoder,
+                             rows: Vec<Vec<Option<String>>>,
+                             started: &mut bool|
+             -> DbResult<()> {
+                if !*started && decoder.has_header() {
+                    if decoder.columns.is_empty() {
+                        return Err(DbError::other("This statement returns no rows to export."));
+                    }
+                    sink.start(&decoder.columns).map_err(io)?;
+                    *started = true;
+                }
+                for row in &rows {
+                    sink.row(row).map_err(io)?;
+                }
+                written += rows.len() as u64;
+                Ok(())
+            };
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(transport_error)?;
+                let rows = decoder.push(&chunk, 0).map_err(DbError::other)?;
+                flush(&decoder, rows, &mut started)?;
+            }
+            let rows = decoder.finish(0).map_err(DbError::other)?;
+            flush(&decoder, rows, &mut started)?;
+            if let Some(text) = decoder.exception() {
+                return Err(parse_exception(&text, None));
+            }
+            if !started {
+                return Err(DbError::other("This statement returns no rows to export."));
+            }
+            sink.finish().map_err(io)?;
+            Ok(written)
+        };
+        let result = tokio::select! {
+            result = work => result,
+            () = self.cancelled.notified() => Err(DbError::cancelled()),
+        };
+        *self.running.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        result
     }
 
     async fn close(&self) {}
@@ -861,7 +1109,7 @@ mod tests {
         let result = session
             .execute(
                 "SELECT number AS n FROM numbers(3)",
-                ExecOptions { row_limit: 1000 },
+                ExecOptions::limit(1000),
             )
             .await
             .unwrap();
@@ -898,7 +1146,7 @@ mod tests {
         p.password = Some("pässwörd-密码".into());
         let session = ChSession::connect(p).await.expect("non-ASCII password");
         session
-            .execute("SELECT 1", ExecOptions { row_limit: 0 })
+            .execute("SELECT 1", ExecOptions::limit(0))
             .await
             .unwrap();
         // base64("reader:pässwörd-密码")
@@ -912,7 +1160,7 @@ mod tests {
     async fn the_database_is_set_once_so_use_keeps_working() {
         let server = serve(|_| Reply::Rows(numbers(1))).await;
         let session = ChSession::connect(params(server.port)).await.unwrap();
-        let all = ExecOptions { row_limit: 0 };
+        let all = ExecOptions::limit(0);
         session.execute("SELECT 1", all).await.unwrap();
         session.execute("USE other_db", all).await.unwrap();
         session.execute("SELECT 2", all).await.unwrap();
@@ -949,7 +1197,7 @@ mod tests {
         .await;
         let session = ChSession::connect(params(server.port)).await.unwrap();
         let result = session
-            .execute("SELECT 1", ExecOptions { row_limit: 0 })
+            .execute("SELECT 1", ExecOptions::limit(0))
             .await
             .unwrap();
         assert_eq!(result.rows.len(), 3);
@@ -961,7 +1209,7 @@ mod tests {
         let server = serve(|_| Reply::Rows(numbers(5))).await;
         let session = ChSession::connect(params(server.port)).await.unwrap();
         let result = session
-            .execute("SELECT 1", ExecOptions { row_limit: 0 })
+            .execute("SELECT 1", ExecOptions::limit(0))
             .await
             .unwrap();
         assert_eq!(result.rows.len(), 5);
@@ -979,7 +1227,7 @@ mod tests {
         let result = session
             .execute(
                 "SELECT number FROM system.numbers",
-                ExecOptions { row_limit: 1000 },
+                ExecOptions::limit(1000),
             )
             .await
             .unwrap();
@@ -1006,7 +1254,7 @@ mod tests {
         p.config.read_only = true;
         let session = ChSession::connect(p).await.unwrap();
         session
-            .execute("SELECT 1", ExecOptions { row_limit: 10 })
+            .execute("SELECT 1", ExecOptions::limit(10))
             .await
             .unwrap();
         let request = &server.user_queries()[0];
@@ -1031,7 +1279,7 @@ mod tests {
         .await;
         let session = ChSession::connect(params(server.port)).await.unwrap();
         let result = session
-            .execute("SELECT 1", ExecOptions { row_limit: 50 })
+            .execute("SELECT 1", ExecOptions::limit(50))
             .await
             .unwrap();
         assert_eq!(result.rows.len(), 50);
@@ -1040,7 +1288,7 @@ mod tests {
         // The refusal is remembered: the next statement sends no settings at all.
         let before = server.user_queries().len();
         session
-            .execute("SELECT 2", ExecOptions { row_limit: 50 })
+            .execute("SELECT 2", ExecOptions::limit(50))
             .await
             .unwrap();
         let after = server.user_queries();
@@ -1070,7 +1318,7 @@ mod tests {
         })
         .await;
         let session = ChSession::connect(params(server.port)).await.unwrap();
-        let all = ExecOptions { row_limit: 0 };
+        let all = ExecOptions::limit(0);
 
         let syntax = session.execute("SELECT 1 FROMM t", all).await.unwrap_err();
         assert_eq!(syntax.kind, ErrorKind::Syntax);
@@ -1124,7 +1372,7 @@ mod tests {
         let runner = session.clone();
         let task = tokio::spawn(async move {
             runner
-                .execute("SELECT sleep(60)", ExecOptions { row_limit: 0 })
+                .execute("SELECT sleep(60)", ExecOptions::limit(0))
                 .await
         });
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1153,7 +1401,7 @@ mod tests {
         let result = session
             .execute(
                 "SELECT n FROM t FORMAT JSONEachRow",
-                ExecOptions { row_limit: 100 },
+                ExecOptions::limit(100),
             )
             .await
             .unwrap();
@@ -1166,10 +1414,7 @@ mod tests {
         let server = serve(|_| Reply::Written(42)).await;
         let session = ChSession::connect(params(server.port)).await.unwrap();
         let result = session
-            .execute(
-                "INSERT INTO t SELECT * FROM u",
-                ExecOptions { row_limit: 100 },
-            )
+            .execute("INSERT INTO t SELECT * FROM u", ExecOptions::limit(100))
             .await
             .unwrap();
         assert_eq!(result.rows_affected, Some(42));
@@ -1188,7 +1433,7 @@ mod tests {
         .await;
         let session = ChSession::connect(params(server.port)).await.unwrap();
         let error = session
-            .execute("SELECT heavy", ExecOptions { row_limit: 0 })
+            .execute("SELECT heavy", ExecOptions::limit(0))
             .await
             .unwrap_err();
         assert!(error.message.contains("Memory limit"), "{error:?}");

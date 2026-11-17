@@ -1,6 +1,6 @@
 // Open editor tabs. Each tab has its own text, row limit, connection and results.
 
-import type { DbError, RunResult } from './types';
+import type { AiError, AiEvent, AiOutcome, DbError, RunResult } from './types';
 
 /** One executed statement and how it went. */
 export interface StatementRun {
@@ -10,6 +10,29 @@ export interface StatementRun {
   status: 'pending' | 'running' | 'done' | 'failed' | 'skipped';
   result?: RunResult;
   error?: DbError;
+  /** Total rows, once "Count rows" has been asked for. */
+  count?: number;
+  /** What a follow-up (next page, fetch all, count, export, apply) is doing, if anything. */
+  busy?: 'page' | 'all' | 'count' | 'export' | 'apply';
+  /** Shown under the grid: the outcome of the last follow-up. */
+  note?: string;
+  /** Set when this ran as EXPLAIN, to show the plan as a tree. */
+  plan?: boolean;
+  /** Staged cell edits: row index → column index → new value (null = NULL). */
+  edits?: Record<number, Record<number, string | null>>;
+  /** The AI's suggested fix for a failed statement. */
+  fix?: FixState;
+}
+
+export interface FixState {
+  /** Request id, for cancel. */
+  id: string;
+  status: 'loading' | 'ready' | 'failed' | 'accepted' | 'dismissed';
+  /** The answer as it streams in. */
+  text: string;
+  outcome?: AiOutcome;
+  error?: AiError;
+  context?: Extract<AiEvent, { type: 'context' }>;
 }
 
 export interface Tab {
@@ -28,6 +51,10 @@ export interface Tab {
   queryId: string | null;
   /** Read-only tabs show generated text (DDL) and cannot be run by accident. */
   generated: boolean;
+  /** The `.sql` file this tab was opened from or saved to. */
+  path: string | null;
+  /** Text as last saved to `path`, to know whether there are unsaved changes. */
+  savedText: string | null;
 }
 
 class Tabs {
@@ -42,7 +69,7 @@ class Tabs {
   open(
     rowLimit: number,
     text = '',
-    options: Partial<Pick<Tab, 'connectionId' | 'title' | 'generated'>> = {},
+    options: Partial<Pick<Tab, 'connectionId' | 'title' | 'generated' | 'path'>> = {},
   ): Tab {
     const id = this.#nextId++;
     this.list.push({
@@ -50,12 +77,19 @@ class Tabs {
       title: options.title ?? `Query ${id}`,
       text,
       rowLimit,
-      connectionId: options.connectionId ?? this.active?.connectionId ?? null,
+      // A new tab starts on the current tab's connection unless told otherwise
+      // (an explicit null means "no connection").
+      connectionId:
+        'connectionId' in options
+          ? (options.connectionId ?? null)
+          : (this.active?.connectionId ?? null),
       runs: [],
       shown: 0,
       running: false,
       queryId: null,
       generated: options.generated ?? false,
+      path: options.path ?? null,
+      savedText: options.path ? text : null,
     });
     this.activeId = id;
     // Return the reactive proxy stored in the list, not the plain object.
