@@ -1,0 +1,36 @@
+# Maintainer: Dominic Plouffe <https://github.com/dominicplouffe>
+#
+# rowboat-sql-bin installs the official Rowboat release build.
+#   yay -S rowboat-sql-bin
+#
+# The package is called rowboat-sql because an unrelated application is also
+# named Rowboat. The checksums below are filled in by the release workflow
+# (packaging/arch/validate.sh), which also builds and installs this package in
+# an Arch container on every CI run.
+
+_upstreamver=0.1.0
+pkgname=rowboat-sql-bin
+pkgver=${_upstreamver//-/_}
+pkgrel=1
+pkgdesc='Fast, lightweight SQL client with an AI copilot for PostgreSQL, ClickHouse and SQLite'
+arch=('x86_64')
+url='https://github.com/dominicplouffe/Rowboat'
+license=('MIT')
+depends=('webkit2gtk-4.1' 'gtk3' 'glib2' 'cairo' 'gdk-pixbuf2' 'libsoup3' 'hicolor-icon-theme' 'glibc' 'gcc-libs')
+provides=('rowboat-sql')
+conflicts=('rowboat-sql')
+options=('!strip' '!debug')
+source=("Rowboat_${_upstreamver}_amd64.deb::${url}/releases/download/v${_upstreamver}/Rowboat_${_upstreamver}_amd64.deb"
+        "LICENSE-${_upstreamver}::https://raw.githubusercontent.com/dominicplouffe/Rowboat/v${_upstreamver}/LICENSE")
+noextract=("Rowboat_${_upstreamver}_amd64.deb")
+sha256sums=('SKIP'
+            'SKIP')
+
+package() {
+  # A .deb is an ar archive; its payload is data.tar.{gz,xz,zst}.
+  bsdtar -xf "Rowboat_${_upstreamver}_amd64.deb" --include 'data.tar.*'
+  bsdtar -xf data.tar.* -C "${pkgdir}"
+  # Directories in the .deb may carry Debian-specific modes.
+  find "${pkgdir}" -type d -exec chmod 755 {} +
+  install -Dm644 "LICENSE-${_upstreamver}" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}
