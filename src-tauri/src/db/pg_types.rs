@@ -560,8 +560,11 @@ fn range(element: &Type, r: &mut Reader) -> Option<String> {
 }
 
 fn multirange(range_type: &Type, raw: &[u8]) -> Option<String> {
-    let Kind::Range(element) = range_type.kind() else {
-        return None;
+    // Depending on how the type was resolved this is either the range type
+    // or already its element type.
+    let element = match range_type.kind() {
+        Kind::Range(element) => element,
+        _ => range_type,
     };
     let mut r = Reader(raw);
     let count = r.i32()?;
