@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::connections::{AppDb, ConnectionConfig, HistoryEntry, SshAuth};
 use crate::db::{
     self, ConnectParams, DbError, DbKind, DbResult, EditTarget, ErrorKind, ExecOptions,
-    QueryResult, SchemaNode, SchemaSnapshot, Session,
+    QueryResult, SchemaDetails, SchemaNode, SchemaSnapshot, Session,
 };
 use crate::edits::{update_statements, RowEdit};
 use crate::export::{self, Format};
@@ -77,7 +77,7 @@ pub struct RunOptions {
     pub uncapped: bool,
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
@@ -620,6 +620,33 @@ impl Manager {
         self.db
             .history_search(connection_id, search, limit)
             .map_err(internal)
+    }
+
+    // ------------------------------------------------------------------ AI --
+
+    pub fn ai_key(&self, provider_id: &str) -> Result<Option<String>, String> {
+        self.secrets.ai_key(provider_id)
+    }
+
+    pub fn set_ai_key(&self, provider_id: &str, key: &str) -> Result<(), String> {
+        self.secrets.set_ai_key(provider_id, key)
+    }
+
+    pub fn config(&self, connection_id: &str) -> DbResult<ConnectionConfig> {
+        self.db.get(connection_id).map_err(internal)
+    }
+
+    pub async fn is_open(&self, connection_id: &str) -> bool {
+        self.sessions.lock().await.contains_key(connection_id)
+    }
+
+    /// The catalog facts the AI schema index adds to the snapshot.
+    pub async fn details(&self, connection_id: &str, samples: bool) -> DbResult<SchemaDetails> {
+        self.session(connection_id)
+            .await?
+            .session
+            .details(samples)
+            .await
     }
 
     pub fn history_clear(&self) -> DbResult<()> {

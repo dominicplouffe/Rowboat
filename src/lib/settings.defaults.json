@@ -48,6 +48,8 @@
     "sshKnownHosts": "ask"
   },
   "ai": {
+    "providers": [],
+    "defaultProvider": "",
     "autoSuggestFixes": true,
     "sendSampleValues": false,
     "schemaTokenBudget": 4000,

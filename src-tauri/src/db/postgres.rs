@@ -30,6 +30,7 @@ use super::{
     quote_ident, quote_literal, Column, ConnectParams, DbError, DbKind, DbResult, ErrorKind,
     ExecOptions, QueryResult, SchemaNode, Session,
 };
+use super::{ColumnDetails, SchemaDetails, TableDetails};
 use super::{
     EditTarget, ForeignKey, RowSink, SchemaSnapshot, SnapshotColumn, SnapshotFunction,
     SnapshotTable,
@@ -1368,6 +1369,128 @@ impl Session for PgSession {
             tables,
             functions,
         })
+    }
+
+    async fn details(&self, samples: bool) -> DbResult<SchemaDetails> {
+        const USER_SCHEMAS: &str =
+            "n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast|temp)'";
+        let mut details = SchemaDetails {
+            server_version: self
+                .catalog("SHOW server_version".into())
+                .await?
+                .first()
+                .map(|row| cell(row, 0))
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        for row in &self
+            .catalog(format!(
+                "SELECT n.nspname, c.relname, COALESCE(pg_catalog.obj_description(c.oid, 'pg_class'), ''), \
+                        c.reltuples::bigint::text \
+                 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND {USER_SCHEMAS} \
+                 ORDER BY n.nspname, c.relname"
+            ))
+            .await?
+        {
+            details.tables.push(TableDetails {
+                schema: cell(row, 0),
+                name: cell(row, 1),
+                comment: cell(row, 2),
+                // -1 means the table has never been analyzed.
+                row_estimate: cell(row, 3).parse().ok().filter(|n: &i64| *n >= 0),
+                ..Default::default()
+            });
+        }
+        fn table<'a>(
+            tables: &'a mut [TableDetails],
+            row: &[Option<String>],
+        ) -> Option<&'a mut TableDetails> {
+            let (schema, name) = (cell(row, 0), cell(row, 1));
+            tables
+                .iter_mut()
+                .find(|t| t.schema == schema && t.name == name)
+        }
+
+        for row in &self
+            .catalog(format!(
+                "SELECT n.nspname, c.relname, a.attname, (NOT a.attnotnull)::text, \
+                        COALESCE(pg_catalog.col_description(c.oid, a.attnum), ''), \
+                        COALESCE((SELECT string_agg(e.enumlabel, chr(31) ORDER BY e.enumsortorder) \
+                                  FROM pg_catalog.pg_enum e WHERE e.enumtypid = a.atttypid), '') \
+                 FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped \
+                 WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND {USER_SCHEMAS} \
+                 ORDER BY n.nspname, c.relname, a.attnum"
+            ))
+            .await?
+        {
+            if let Some(owner) = table(&mut details.tables, row) {
+                let labels = cell(row, 5);
+                owner.columns.push(ColumnDetails {
+                    name: cell(row, 2),
+                    nullable: cell(row, 3) == "true",
+                    comment: cell(row, 4),
+                    values: if labels.is_empty() {
+                        Vec::new()
+                    } else {
+                        labels.split('\u{1f}').map(str::to_string).collect()
+                    },
+                });
+            }
+        }
+
+        for row in &self
+            .catalog(format!(
+                "SELECT n.nspname, c.relname, \
+                        (CASE WHEN i.indisunique THEN 'unique ' ELSE '' END) || pg_catalog.pg_get_indexdef(i.indexrelid) \
+                 FROM pg_catalog.pg_index i \
+                 JOIN pg_catalog.pg_class c ON c.oid = i.indrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE NOT i.indisprimary AND {USER_SCHEMAS} ORDER BY 1, 2, 3"
+            ))
+            .await?
+        {
+            if let Some(owner) = table(&mut details.tables, row) {
+                // "unique CREATE UNIQUE INDEX x ON t USING btree (a)" → "unique btree (a)"
+                let def = cell(row, 2);
+                let unique = if def.starts_with("unique ") { "unique " } else { "" };
+                if let Some((_, using)) = def.split_once(" USING ") {
+                    owner.indexes.push(format!("{unique}{using}"));
+                }
+            }
+        }
+
+        if samples {
+            // The planner's statistics already hold the most common values, so
+            // no table is scanned for this.
+            let rows = self
+                .catalog(
+                    "SELECT s.schemaname, s.tablename, s.attname, left(u.v, 40) \
+                     FROM pg_catalog.pg_stats s, \
+                          unnest(s.most_common_vals::text::text[]) WITH ORDINALITY AS u(v, ord) \
+                     WHERE s.n_distinct > 0 AND s.n_distinct <= 12 AND u.ord <= 6 \
+                       AND s.schemaname NOT IN ('pg_catalog', 'information_schema') \
+                     ORDER BY 1, 2, 3, u.ord"
+                        .into(),
+                )
+                .await
+                .unwrap_or_default();
+            for row in &rows {
+                let Some(owner) = table(&mut details.tables, row) else {
+                    continue;
+                };
+                let name = cell(row, 2);
+                if let Some(column) = owner.columns.iter_mut().find(|c| c.name == name) {
+                    // Enum labels are already complete; do not mix samples in.
+                    if column.values.len() < 6 && !column.values.contains(&cell(row, 3)) {
+                        column.values.push(cell(row, 3));
+                    }
+                }
+            }
+        }
+        Ok(details)
     }
 
     async fn export(&self, sql: &str, sink: Box<dyn RowSink>) -> DbResult<u64> {

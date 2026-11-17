@@ -3,12 +3,14 @@
 //! All database, AI and secret handling lives on this side of the IPC boundary;
 //! the webview only renders. M0 provides the settings store and app metadata.
 
+pub mod ai;
 pub mod connections;
 pub mod db;
 pub mod edits;
 pub mod error;
 pub mod export;
 pub mod manager;
+pub mod sample;
 pub mod secrets;
 pub mod settings;
 pub mod ssh;
@@ -22,12 +24,14 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager as _, State};
 use tauri_plugin_dialog::DialogExt;
 
+use ai::copilot::{AiEvent, AiOutcome, AiRequest, Copilot, IndexInfo};
+use ai::{AiError, AiResult};
 use connections::{AppDb, ConnectionConfig, HistoryEntry};
 use db::{DbKind, DbResult, SchemaNode, SchemaSnapshot};
 use error::{Error, Result};
 use manager::{ConnectionView, Manager, RunOptions, RunResult, SecretInput};
 use secrets::Secrets;
-use settings::{Settings, SettingsStore};
+use settings::{AiProvider, Settings, SettingsStore};
 use statements::StatementSpan;
 
 /// When set, the app writes its startup time to this file and exits once the
@@ -175,6 +179,148 @@ fn open_data_folder(store: State<'_, SettingsStore>) -> Result<()> {
     };
     std::process::Command::new(opener).arg(&dir).spawn()?;
     Ok(())
+}
+
+// ------------------------------------------------------------------- AI ----
+//
+// An API key flows inwards once (`ai_key_set`) and is never returned. The
+// copilot returns text only: no command here can run a statement.
+
+/// Saves a provider's API key in the OS keychain; an empty key deletes it.
+#[tauri::command]
+fn ai_key_set(manager: State<'_, Manager>, provider_id: String, key: String) -> AiResult<()> {
+    manager
+        .set_ai_key(&provider_id, key.trim())
+        .map_err(|e| AiError::other(format!("Could not save the API key in the keychain: {e}")))
+}
+
+/// Which of the configured providers have a key saved.
+#[tauri::command]
+fn ai_key_status(
+    manager: State<'_, Manager>,
+    store: State<'_, SettingsStore>,
+) -> std::collections::BTreeMap<String, bool> {
+    store
+        .get()
+        .ai
+        .providers
+        .iter()
+        .map(|p| (p.id.clone(), matches!(manager.ai_key(&p.id), Ok(Some(_)))))
+        .collect()
+}
+
+/// The provider's live model list. Takes the provider itself, not its id, so
+/// the wizard can list models before anything is saved to settings.
+#[tauri::command]
+async fn ai_models(
+    manager: State<'_, Manager>,
+    store: State<'_, SettingsStore>,
+    provider: AiProvider,
+) -> AiResult<Vec<String>> {
+    let endpoint = ai::copilot::endpoint(&provider, &manager, store.get().ai.request_timeout_secs)?;
+    ai::list_models(&ai::http_client()?, &endpoint).await
+}
+
+/// A minimal real call, to prove the key, the endpoint and the model work.
+#[tauri::command]
+async fn ai_test(
+    manager: State<'_, Manager>,
+    store: State<'_, SettingsStore>,
+    provider: AiProvider,
+) -> AiResult<String> {
+    if provider.model.is_empty() {
+        return Err(AiError::new(
+            ai::AiErrorKind::NotConfigured,
+            "Choose a model first.",
+        ));
+    }
+    let endpoint = ai::copilot::endpoint(&provider, &manager, store.get().ai.request_timeout_secs)?;
+    let request = ai::ChatRequest {
+        model: provider.model.clone(),
+        system: "This is a connection test. Reply with the single word OK.".into(),
+        messages: vec![ai::Message {
+            role: ai::Role::User,
+            content: "ping".into(),
+        }],
+    };
+    let mut reply = String::new();
+    let mut on_delta = |text: &str| reply.push_str(text);
+    ai::stream_chat(
+        &ai::http_client()?,
+        &endpoint,
+        &request,
+        &tokio::sync::Notify::new(),
+        &mut on_delta,
+    )
+    .await?;
+    Ok(reply.trim().chars().take(80).collect())
+}
+
+/// Ask, Fix or Explain. Progress streams over `on_event`; the result is text.
+#[tauri::command]
+async fn ai_run(
+    copilot: State<'_, Copilot>,
+    manager: State<'_, Manager>,
+    store: State<'_, SettingsStore>,
+    request: AiRequest,
+    on_event: tauri::ipc::Channel<AiEvent>,
+) -> AiResult<AiOutcome> {
+    copilot
+        .run(&manager, &store.get(), request, &move |event| {
+            let _ = on_event.send(event);
+        })
+        .await
+}
+
+#[tauri::command]
+fn ai_cancel(copilot: State<'_, Copilot>, id: String) {
+    copilot.cancel(&id);
+}
+
+/// Builds (or with `refresh`, rebuilds) a connection's schema index.
+#[tauri::command]
+async fn ai_index(
+    copilot: State<'_, Copilot>,
+    manager: State<'_, Manager>,
+    connection_id: String,
+    refresh: bool,
+) -> AiResult<Option<IndexInfo>> {
+    copilot.index_info(&manager, &connection_id, refresh).await
+}
+
+/// Creates the bundled sample database (once) and a connection to it.
+#[tauri::command]
+async fn sample_database(
+    manager: State<'_, Manager>,
+    store: State<'_, SettingsStore>,
+) -> DbResult<ConnectionView> {
+    let path = store
+        .path()
+        .parent()
+        .map(|dir| dir.join("sample.db"))
+        .ok_or_else(|| db::DbError::other("The settings folder is unknown."))?;
+    let shown = path.display().to_string();
+    if let Some(existing) = manager
+        .list()
+        .await?
+        .into_iter()
+        .find(|view| view.config.kind == DbKind::Sqlite && view.config.path == shown)
+    {
+        sample::create(&path).map_err(|e| db::DbError::other(e.to_string()))?;
+        return Ok(existing);
+    }
+    sample::create(&path).map_err(|e| db::DbError::other(e.to_string()))?;
+    manager
+        .save(
+            ConnectionConfig {
+                name: "Sample shop".into(),
+                kind: DbKind::Sqlite,
+                path: shown,
+                ..Default::default()
+            },
+            SecretInput::default(),
+        )
+        .await
 }
 
 // ---------------------------------------------------------- connections ----
@@ -629,6 +775,7 @@ pub fn run() {
             let manager = Manager::new(AppDb::open(dir.join("rowboat.db"))?, secrets);
             manager.history_prune(&app.state::<SettingsStore>().get());
             app.manage(manager);
+            app.manage(Copilot::default());
             #[cfg(target_os = "macos")]
             app.set_menu(macos_menu(app.handle())?)?;
             Ok(())
@@ -669,6 +816,14 @@ pub fn run() {
             schema_ddl,
             sql_split,
             pick_file,
+            ai_key_set,
+            ai_key_status,
+            ai_models,
+            ai_test,
+            ai_run,
+            ai_cancel,
+            ai_index,
+            sample_database,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Rowboat");

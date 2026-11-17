@@ -14,7 +14,7 @@ use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 
 use crate::db::DbKind;
 
-fn dialect(kind: DbKind) -> Box<dyn Dialect> {
+pub(crate) fn dialect(kind: DbKind) -> Box<dyn Dialect> {
     match kind {
         DbKind::Postgres => Box::new(PostgreSqlDialect {}),
         DbKind::Clickhouse => Box::new(ClickHouseDialect {}),

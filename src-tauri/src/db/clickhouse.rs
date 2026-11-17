@@ -26,6 +26,7 @@ use super::{
     quote_ident, quote_literal, ConnectParams, DbError, DbKind, DbResult, ErrorKind, ExecOptions,
     QueryResult, SchemaNode, Session,
 };
+use super::{ColumnDetails, SchemaDetails, TableDetails};
 use super::{RowSink, SchemaSnapshot, SnapshotColumn, SnapshotFunction, SnapshotTable};
 use crate::connections::TlsMode;
 
@@ -715,6 +716,66 @@ impl Session for ChSession {
                 })
                 .collect(),
         })
+    }
+
+    async fn details(&self, _samples: bool) -> DbResult<SchemaDetails> {
+        const USER_DATABASES: &str =
+            "database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')";
+        let mut details = SchemaDetails {
+            server_version: self
+                .internal("SELECT version()")
+                .await?
+                .rows
+                .first()
+                .map(|row| cell(row, 0))
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        let tables = self
+            .internal(&format!(
+                "SELECT database, name, engine, sorting_key, partition_key, toString(total_rows), comment \
+                 FROM system.tables WHERE {USER_DATABASES} ORDER BY database, name"
+            ))
+            .await?;
+        for row in &tables.rows {
+            let mut storage = cell(row, 2);
+            if !cell(row, 3).is_empty() {
+                storage.push_str(&format!(" ORDER BY ({})", cell(row, 3)));
+            }
+            if !cell(row, 4).is_empty() {
+                storage.push_str(&format!(" PARTITION BY {}", cell(row, 4)));
+            }
+            details.tables.push(TableDetails {
+                schema: cell(row, 0),
+                name: cell(row, 1),
+                storage,
+                row_estimate: cell(row, 5).parse().ok(),
+                comment: cell(row, 6),
+                ..Default::default()
+            });
+        }
+        let columns = self
+            .internal(&format!(
+                "SELECT database, table, name, type, comment FROM system.columns \
+                 WHERE {USER_DATABASES} ORDER BY database, table, position"
+            ))
+            .await?;
+        for row in &columns.rows {
+            let (schema, name) = (cell(row, 0), cell(row, 1));
+            if let Some(owner) = details
+                .tables
+                .iter_mut()
+                .find(|t| t.schema == schema && t.name == name)
+            {
+                owner.columns.push(ColumnDetails {
+                    name: cell(row, 2),
+                    nullable: cell(row, 3).contains("Nullable("),
+                    comment: cell(row, 4),
+                    values: Vec::new(),
+                });
+            }
+        }
+        Ok(details)
     }
 
     async fn export(&self, sql: &str, mut sink: Box<dyn RowSink>) -> DbResult<u64> {
