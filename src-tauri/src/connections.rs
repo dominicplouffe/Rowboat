@@ -106,6 +106,11 @@ pub struct ConnectionConfig {
     pub path: String,
     /// Create the file if it does not exist.
     pub create: bool,
+
+    /// Off = nothing about this connection is ever sent to an AI provider.
+    pub ai_enabled: bool,
+    /// Let the schema index carry a few example values of low-cardinality columns.
+    pub ai_sample_values: bool,
 }
 
 impl Default for ConnectionConfig {
@@ -127,6 +132,8 @@ impl Default for ConnectionConfig {
             ssh: Ssh::default(),
             path: String::new(),
             create: false,
+            ai_enabled: true,
+            ai_sample_values: false,
         }
     }
 }
@@ -401,6 +408,13 @@ impl AppDb {
             )
             .map_err(db_err)?;
         Ok(())
+    }
+
+    pub fn session_delete(&self, key: &str) -> Result<()> {
+        self.lock()
+            .execute("DELETE FROM session WHERE key = ?1", params![key])
+            .map(|_| ())
+            .map_err(db_err)
     }
 
     pub fn session_load(&self, key: &str) -> Result<Option<String>> {

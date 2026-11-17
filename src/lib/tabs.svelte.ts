@@ -1,6 +1,6 @@
 // Open editor tabs. Each tab has its own text, row limit, connection and results.
 
-import type { DbError, RunResult } from './types';
+import type { AiError, AiEvent, AiOutcome, DbError, RunResult } from './types';
 
 /** One executed statement and how it went. */
 export interface StatementRun {
@@ -20,6 +20,19 @@ export interface StatementRun {
   plan?: boolean;
   /** Staged cell edits: row index → column index → new value (null = NULL). */
   edits?: Record<number, Record<number, string | null>>;
+  /** The AI's suggested fix for a failed statement. */
+  fix?: FixState;
+}
+
+export interface FixState {
+  /** Request id, for cancel. */
+  id: string;
+  status: 'loading' | 'ready' | 'failed' | 'accepted' | 'dismissed';
+  /** The answer as it streams in. */
+  text: string;
+  outcome?: AiOutcome;
+  error?: AiError;
+  context?: Extract<AiEvent, { type: 'context' }>;
 }
 
 export interface Tab {

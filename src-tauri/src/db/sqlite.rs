@@ -16,6 +16,7 @@ use super::{
     hex, quote_ident, quote_literal, Column, ColumnKind, ConnectParams, DbError, DbKind, DbResult,
     ErrorKind, ExecOptions, QueryResult, SchemaNode, Session,
 };
+use super::{ColumnDetails, SchemaDetails, TableDetails};
 use super::{
     EditTarget, ForeignKey, RowSink, SchemaSnapshot, SnapshotColumn, SnapshotFunction,
     SnapshotTable,
@@ -709,6 +710,71 @@ impl Session for SqliteSession {
                 })
                 .collect(),
         })
+    }
+
+    async fn details(&self, _samples: bool) -> DbResult<SchemaDetails> {
+        let text =
+            |row: &[Option<String>], i: usize| row.get(i).cloned().flatten().unwrap_or_default();
+        let mut details = SchemaDetails {
+            server_version: self
+                .query("SELECT sqlite_version()".into())
+                .await?
+                .rows
+                .first()
+                .map(|row| text(row, 0))
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        let columns = self
+            .query(
+                "SELECT m.name, p.name, p.\"notnull\", p.pk \
+                 FROM sqlite_master m, pragma_table_info(m.name) p \
+                 WHERE m.type IN ('table', 'view') AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+                 ORDER BY m.name, p.cid"
+                    .into(),
+            )
+            .await?;
+        for row in &columns.rows {
+            let name = text(row, 0);
+            if details.tables.last().is_none_or(|t| t.name != name) {
+                details.tables.push(TableDetails {
+                    name,
+                    ..Default::default()
+                });
+            }
+            details
+                .tables
+                .last_mut()
+                .expect("just pushed")
+                .columns
+                .push(ColumnDetails {
+                    name: text(row, 1),
+                    nullable: text(row, 2) == "0" && text(row, 3) == "0",
+                    ..Default::default()
+                });
+        }
+        let indexes = self
+            .query(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL ORDER BY name"
+                    .into(),
+            )
+            .await?;
+        for row in &indexes.rows {
+            let table = text(row, 0);
+            let sql = text(row, 1);
+            if let Some(owner) = details.tables.iter_mut().find(|t| t.name == table) {
+                // "CREATE UNIQUE INDEX x ON t (a, b)" → "unique (a, b)"
+                let unique = if sql.to_ascii_uppercase().contains("UNIQUE") {
+                    "unique "
+                } else {
+                    ""
+                };
+                if let Some(open) = sql.find('(') {
+                    owner.indexes.push(format!("{unique}{}", &sql[open..]));
+                }
+            }
+        }
+        Ok(details)
     }
 
     async fn export(&self, sql: &str, sink: Box<dyn RowSink>) -> DbResult<u64> {

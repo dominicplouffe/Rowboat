@@ -294,6 +294,36 @@
         {/if}
       </fieldset>
 
+      <fieldset>
+        <legend>AI copilot</legend>
+        <label class="check">
+          <input type="checkbox" bind:checked={config.aiEnabled} />
+          Allow AI for this connection
+        </label>
+        <p class="note">
+          {#if config.aiEnabled}
+            Table and column names, types, keys, indexes and comments are sent with your questions.
+            Result rows are never sent.
+          {:else}
+            Nothing about this connection is sent to an AI provider.
+          {/if}
+        </p>
+        {#if config.kind === 'postgres'}
+          <label class="check">
+            <input
+              type="checkbox"
+              bind:checked={config.aiSampleValues}
+              disabled={!config.aiEnabled}
+            />
+            Also send a few common values of low-cardinality columns
+          </label>
+          <p class="note">
+            Helps with WHERE filters (for example the values of a status column). These are real
+            values from your data, read from the planner's statistics.
+          </p>
+        {/if}
+      </fieldset>
+
       {#if server}
         <fieldset>
           <legend>Server</legend>

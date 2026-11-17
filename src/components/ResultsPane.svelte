@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { ai } from '../lib/ai.svelte';
   import { looksLikeJson } from '../lib/cells';
   import { connections } from '../lib/connections.svelte';
   import { dialogs } from '../lib/dialogs.svelte';
@@ -213,11 +214,15 @@
       label: `Loaded rows as ${label}`,
       run: () => exportPage(format),
     })),
-    ...FORMATS.map(([format, label], i) => ({
-      label: `Full result as ${label}`,
-      separator: i === 0,
-      run: () => exportAll(format),
-    })),
+    // The full result is fetched by running the statement again, which is
+    // only offered for plain reads.
+    ...(result?.repeatable
+      ? FORMATS.map(([format, label], i) => ({
+          label: `Full result as ${label}`,
+          separator: i === 0,
+          run: () => exportAll(format),
+        }))
+      : []),
   ]);
 
   // ---- inline editing ----
@@ -364,6 +369,17 @@
       {#if shown.error.detail}<p class="muted">{shown.error.detail}</p>{/if}
       {#if shown.error.hint}<p class="hint">{shown.error.hint}</p>{/if}
       {#if shown.error.code}<p class="code muted">Code {shown.error.code}</p>{/if}
+      {#if ai.fixable(tab, shown)}
+        {#if shown.fix && shown.fix.status !== 'dismissed'}
+          {#await import('./FixSuggestion.svelte') then { default: FixSuggestion }}
+            <FixSuggestion {tab} statement={shown} />
+          {/await}
+        {:else}
+          <button class="btn" onclick={() => ai.suggestFix(tab, shown)}
+            >Suggest a fix with AI</button
+          >
+        {/if}
+      {/if}
     </div>
   {:else if result}
     {#if result.notices.length > 0}
@@ -418,14 +434,19 @@
           {#if shown.busy !== 'apply'}<button class="btn" onclick={() => cancel(tab)}>Cancel</button
             >{/if}
         {:else}
-          {#if result.moreAvailable}
+          {#if result.moreAvailable && !result.repeatable}
+            <span class="muted">
+              More rows exist, but this statement changes data, so it is not run again to fetch
+              them.
+            </span>
+          {:else if result.moreAvailable}
             <span class="muted">More rows available.</span>
             <button class="btn" onclick={() => fetchNextPage(tab)}>Fetch next page</button>
             <button class="btn" onclick={fetchEverything}>Fetch all</button>
           {:else}
             <span class="muted">All rows loaded.</span>
           {/if}
-          {#if shown?.count === undefined}
+          {#if shown?.count === undefined && result.repeatable}
             <button class="btn" onclick={() => countRows(tab)}>Count rows</button>
           {/if}
           {#if result.editable && !connection?.readOnly}

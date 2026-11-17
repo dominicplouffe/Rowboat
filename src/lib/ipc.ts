@@ -5,6 +5,11 @@
 // is compiled out of production bundles.
 
 import type {
+  AiError,
+  AiEvent,
+  AiOutcome,
+  AiProvider,
+  AiRequest,
   AppInfo,
   Column,
   ConnectionConfig,
@@ -15,6 +20,7 @@ import type {
   ExportFormat,
   FilePurpose,
   HistoryEntry,
+  IndexInfo,
   RowEdit,
   RunOptions,
   RunResult,
@@ -23,6 +29,7 @@ import type {
   SecretInput,
   Settings,
   StatementSpan,
+  UpdateInfo,
 } from './types';
 
 type Invoke = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
@@ -133,7 +140,46 @@ export const ipc = {
 
   /** Opens a native file dialog; resolves to the path, or null when cancelled. */
   pickFile: (purpose: FilePurpose) => call<string | null>('pick_file', { purpose }),
+
+  // AI. These reject with an AiError (see `asAiError`). A key goes in once
+  // and is never read back.
+  aiKeySet: (providerId: string, key: string) => call<void>('ai_key_set', { providerId, key }),
+  aiKeyStatus: () => call<Record<string, boolean>>('ai_key_status'),
+  aiModels: (provider: AiProvider) => call<string[]>('ai_models', { provider }),
+  /** One small real request; resolves to the model's reply. */
+  aiTest: (provider: AiProvider) => call<string>('ai_test', { provider }),
+  /** Ask, Fix or Explain. `onEvent` receives the payload sent and the answer as it streams. */
+  aiRun: async (request: AiRequest, onEvent: (event: AiEvent) => void) => {
+    if (!inTauri) return call<AiOutcome>('ai_run', { request, onEvent });
+    const { Channel } = await import('@tauri-apps/api/core');
+    const channel = new Channel<AiEvent>();
+    channel.onmessage = onEvent;
+    return call<AiOutcome>('ai_run', { request, onEvent: channel });
+  },
+  aiCancel: (id: string) => call<void>('ai_cancel', { id }),
+  /** Builds (or with `refresh`, rebuilds) the schema index. Null when there is none and the connection is closed. */
+  aiIndex: (connectionId: string, refresh: boolean) =>
+    call<IndexInfo | null>('ai_index', { connectionId, refresh }),
+
+  /**
+   * Asks GitHub whether a newer release exists; null when there is none or
+   * when update checks are off (`manual` overrides that). Rejects with a string.
+   */
+  updateCheck: (manual: boolean) => call<UpdateInfo | null>('update_check', { manual }),
+  /** Opens a Rowboat release page in the browser. */
+  updateOpen: (url: string) => call<void>('update_open', { url }),
+
+  /** Creates the sample SQLite database and a connection to it. */
+  sampleDatabase: () => call<ConnectionView>('sample_database'),
 };
+
+/** Normalizes whatever a failed AI command threw into an AiError. */
+export function asAiError(error: unknown): AiError {
+  if (error && typeof error === 'object' && 'kind' in error && 'message' in error) {
+    return error as AiError;
+  }
+  return { kind: 'other', message: error instanceof Error ? error.message : String(error) };
+}
 
 /** Normalizes whatever a failed command threw into a DbError. */
 export function asDbError(error: unknown): DbError {

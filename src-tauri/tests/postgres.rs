@@ -1082,3 +1082,96 @@ async fn client_certificate_authenticates_without_a_password() {
         "no certificate, no login"
     );
 }
+
+#[tokio::test]
+async fn details_add_comments_nullability_enums_indexes_and_opt_in_samples() {
+    let s = connect().await;
+    let schema = format!("det_{}", std::process::id());
+    for sql in [
+        format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+        format!("CREATE SCHEMA {schema}"),
+        format!("CREATE TYPE {schema}.order_status AS ENUM ('new', 'paid', 'shipped')"),
+        format!(
+            "CREATE TABLE {schema}.orders (id int PRIMARY KEY, status {schema}.order_status NOT NULL, \
+             channel text, note text)"
+        ),
+        format!("COMMENT ON TABLE {schema}.orders IS 'One row per checkout'"),
+        format!("COMMENT ON COLUMN {schema}.orders.note IS 'Free text from support'"),
+        format!("CREATE UNIQUE INDEX ON {schema}.orders (channel, id)"),
+        format!(
+            "INSERT INTO {schema}.orders SELECT n, 'paid', (ARRAY['web', 'store'])[1 + n % 2], 'secret note ' || n \
+             FROM generate_series(1, 400) n"
+        ),
+        format!("ANALYZE {schema}.orders"),
+    ] {
+        s.execute(&sql, ALL).await.unwrap();
+    }
+
+    let find = |details: &rowboat_lib::db::SchemaDetails| {
+        details
+            .tables
+            .iter()
+            .find(|t| t.schema == schema && t.name == "orders")
+            .cloned()
+            .expect("the table is described")
+    };
+    let details = s.details(false).await.unwrap();
+    assert!(!details.server_version.is_empty());
+    let orders = find(&details);
+    assert_eq!(orders.comment, "One row per checkout");
+    assert_eq!(orders.row_estimate, Some(400));
+    assert_eq!(
+        orders.indexes,
+        ["unique btree (channel, id)"],
+        "the primary key is not repeated"
+    );
+    let column = |name: &str| {
+        orders
+            .columns
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap()
+            .clone()
+    };
+    assert!(!column("status").nullable && column("channel").nullable);
+    assert_eq!(
+        column("status").values,
+        ["new", "paid", "shipped"],
+        "enum labels"
+    );
+    assert_eq!(column("note").comment, "Free text from support");
+    assert!(
+        column("channel").values.is_empty(),
+        "no data values unless asked for"
+    );
+
+    let with_samples = find(&s.details(true).await.unwrap());
+    let column = |name: &str| {
+        with_samples
+            .columns
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap()
+            .clone()
+    };
+    let mut channels = column("channel").values;
+    channels.sort();
+    assert_eq!(
+        channels,
+        ["store", "web"],
+        "common values of a low-cardinality column"
+    );
+    assert!(
+        column("note").values.is_empty(),
+        "high-cardinality columns are never sampled"
+    );
+    assert_eq!(
+        column("status").values,
+        ["new", "paid", "shipped"],
+        "enum labels are left alone"
+    );
+
+    s.execute(&format!("DROP SCHEMA {schema} CASCADE"), ALL)
+        .await
+        .unwrap();
+}

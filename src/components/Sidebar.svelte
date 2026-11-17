@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { ai } from '../lib/ai.svelte';
   import { ACTIONS } from '../lib/actions';
   import { connections, KIND_LABELS } from '../lib/connections.svelte';
   import { dialogs } from '../lib/dialogs.svelte';
@@ -94,6 +95,9 @@
       },
       ...(connection.connected
         ? [{ label: 'Refresh', run: () => schema.refresh(connection.id) }]
+        : []),
+      ...(connection.connected && connection.aiEnabled !== false
+        ? [{ label: 'Re-index schema for AI', run: () => void ai.reindex(connection.id, true) }]
         : []),
       { label: 'Edit…', run: () => void (dialogs.connection = { editing: connection }) },
     ]);

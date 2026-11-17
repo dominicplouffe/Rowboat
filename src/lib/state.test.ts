@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { ipc } from './ipc';
 import { settings } from './settings.svelte';
 import { tabs } from './tabs.svelte';
+import type { Settings } from './types';
+import { ui } from './ui.svelte';
 
 describe('tabs', () => {
   beforeEach(() => {
@@ -74,5 +76,38 @@ describe('settings store', () => {
     expect(settings.value?.keyboard.overrides).toEqual({ 'settings.open': 'Mod+Shift+P' });
     settings.setShortcut('settings.open', null);
     expect(settings.value?.keyboard.overrides).toEqual({});
+  });
+});
+
+describe('update check', () => {
+  /** Stores a change and waits for the core to have it. */
+  async function configure(change: Partial<Settings['general']>): Promise<void> {
+    const current = await ipc.settingsGet();
+    await ipc.settingsSet({ ...current, general: { ...current.general, ...change } });
+    await settings.load();
+  }
+  const found = () => ui.update;
+
+  beforeEach(async () => {
+    await ipc.settingsReset();
+    ui.update = null;
+  });
+
+  it('finds nothing on the stable channel and a pre-release on beta', async () => {
+    await configure({ updateChannel: 'stable' });
+    expect(await ui.checkForUpdate(false)).toBeNull();
+    expect(found()).toBeNull();
+
+    await configure({ updateChannel: 'beta' });
+    await ui.checkForUpdate(false);
+    expect(found()?.version).toBe('0.2.0-beta.1');
+  });
+
+  it('makes no automatic check when turned off, but "Check now" still works', async () => {
+    await configure({ updateChannel: 'beta', updateChecks: 'off' });
+    await ui.checkForUpdate(false);
+    expect(found()).toBeNull();
+    await ui.checkForUpdate(true);
+    expect(found()?.version).toBe('0.2.0-beta.1');
   });
 });

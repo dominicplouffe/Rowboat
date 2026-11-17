@@ -77,8 +77,13 @@
   $effect(() => {
     if (rows === previousRows) return;
     // More rows of the same query (next page) keep the view; a new result resets it.
+    // Compared by value: a refetch brings the same rows back as new arrays.
+    const before = Array.isArray(previousRows) ? (previousRows[0] as unknown[] | undefined) : null;
     const samePrefix =
-      Array.isArray(previousRows) && previousRows.length > 0 && rows[0] === previousRows[0];
+      !!before &&
+      rows.length >= (previousRows as unknown[]).length &&
+      rows[0]?.length === before.length &&
+      rows[0].every((value, i) => value === before[i]);
     previousRows = rows;
     if (samePrefix) return;
     selected = null;

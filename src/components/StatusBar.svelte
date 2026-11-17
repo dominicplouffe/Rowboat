@@ -1,5 +1,6 @@
 <script lang="ts">
   import { connections } from '../lib/connections.svelte';
+  import { ipc } from '../lib/ipc';
   import { formatRowLimit } from '../lib/rowLimit';
   import { settings } from '../lib/settings.svelte';
   import { tabs } from '../lib/tabs.svelte';
@@ -38,12 +39,25 @@
   {#if settings.error}
     <span class="error" role="alert">Could not save settings: {settings.error}</span>
   {/if}
+  {#if ui.update}
+    <button
+      class="update"
+      onclick={() => ipc.updateOpen(ui.update!.url)}
+      title="Open the release page to download it"
+    >
+      Rowboat {ui.update.version} is available
+    </button>
+  {/if}
   {#if info}
     <span>Rowboat {info.version}</span>
   {/if}
 </footer>
 
 <style>
+  .update {
+    color: var(--accent);
+    font-weight: 600;
+  }
   .status {
     display: flex;
     align-items: center;

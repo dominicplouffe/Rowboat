@@ -4,6 +4,7 @@
   import StatusBar from './components/StatusBar.svelte';
   import Workspace from './components/Workspace.svelte';
   import { ACTIONS } from './lib/actions';
+  import { ai } from './lib/ai.svelte';
   import { connections } from './lib/connections.svelte';
   import { dialogs } from './lib/dialogs.svelte';
   import { prompts } from './lib/runner';
@@ -39,6 +40,15 @@
       danger: true,
       prod: connections.list.find((c) => c.name === connectionName)?.environment === 'prod',
     });
+  prompts.schemaChanged = (id) => {
+    if (ai.provider) void ai.reindex(id, true);
+  };
+  // Failed statements go to the copilot, which decides whether a fix may be suggested.
+  prompts.failed = (tab, statement) => void ai.autoFix(tab, statement);
+  // Index a schema as soon as its connection opens, but only once AI is set up.
+  connections.opened = (id) => {
+    if (ai.provider) void ai.reindex(id, true);
+  };
   connections.askHostKey = (prompt) =>
     dialogs.confirm({
       title: 'Trust this SSH server?',
@@ -75,6 +85,10 @@ SELECT 1;
     }
     // Without settings there is no editor to wait for.
     if (loadError) reportReady();
+    // Well after startup, and only if the user has not turned it off.
+    if (settings.value && settings.value.general.updateChecks !== 'off') {
+      setTimeout(() => void ui.checkForUpdate(false), 8000);
+    }
     ipc.appInfo().then(
       (i) => (info = i),
       () => {},
@@ -82,7 +96,9 @@ SELECT 1;
   });
 
   function onKeydown(event: KeyboardEvent) {
-    if (ui.settingsOpen || ui.historyOpen || dialogs.anyOpen) return; // Dialogs handle their own keys.
+    // Dialogs handle their own keys.
+    if (ui.settingsOpen || ui.historyOpen || dialogs.anyOpen || ai.open) return;
+    if (!settings.value?.general.onboardingCompleted) return;
     const chord = chordFromEvent(event);
     if (!chord) return;
     const action = findAction(ACTIONS, settings.value?.keyboard.overrides ?? {}, chord);
@@ -124,6 +140,16 @@ SELECT 1;
   {#if dialogs.confirmRequest}
     {#await import('./components/ConfirmDialog.svelte') then { default: ConfirmDialog }}
       {#key dialogs.confirmRequest}<ConfirmDialog />{/key}
+    {/await}
+  {/if}
+  {#if ai.open}
+    {#await import('./components/AskPanel.svelte') then { default: AskPanel }}
+      <AskPanel />
+    {/await}
+  {/if}
+  {#if !settings.value.general.onboardingCompleted}
+    {#await import('./components/Onboarding.svelte') then { default: Onboarding }}
+      <Onboarding {info} />
     {/await}
   {/if}
   {#if ui.historyOpen}

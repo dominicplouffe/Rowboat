@@ -251,10 +251,31 @@ impl Default for Connections {
     }
 }
 
+/// One AI provider. Holds no secret: the key is in the OS keychain.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AiProvider {
+    pub id: String,
+    pub kind: crate::ai::ProviderKind,
+    pub name: String,
+    /// Empty = the provider's standard endpoint.
+    pub base_url: String,
+    /// Azure OpenAI deployment name.
+    pub deployment: String,
+    /// Model for Ask and Explain.
+    pub model: String,
+    /// Model for fixes; empty = same as `model`.
+    pub fix_model: String,
+}
+
 /// Non-secret AI preferences. Provider keys live in the OS keychain.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Ai {
+    /// Configured providers. Their API keys are in the keychain, keyed by `id`.
+    pub providers: Vec<AiProvider>,
+    /// `id` of the provider used unless a request names another; empty = AI off.
+    pub default_provider: String,
     pub auto_suggest_fixes: bool,
     /// Default for new connections; sample values are opt-in per connection.
     pub send_sample_values: bool,
@@ -265,6 +286,8 @@ pub struct Ai {
 impl Default for Ai {
     fn default() -> Self {
         Self {
+            providers: Vec::new(),
+            default_provider: String::new(),
             auto_suggest_fixes: true,
             send_sample_values: false,
             schema_token_budget: 4000,
@@ -399,6 +422,31 @@ impl Settings {
         c.keepalive_secs = c.keepalive_secs.min(3_600);
 
         let ai = &mut self.ai;
+        for provider in &mut ai.providers {
+            for field in [
+                &mut provider.id,
+                &mut provider.name,
+                &mut provider.base_url,
+                &mut provider.deployment,
+                &mut provider.model,
+                &mut provider.fix_model,
+            ] {
+                *field = field.trim().to_string();
+            }
+            while provider.base_url.ends_with('/') {
+                provider.base_url.pop();
+            }
+        }
+        ai.providers.retain(|p| !p.id.is_empty());
+        let mut seen = std::collections::HashSet::new();
+        ai.providers.retain(|p| seen.insert(p.id.clone()));
+        if !ai.providers.iter().any(|p| p.id == ai.default_provider) {
+            ai.default_provider = ai
+                .providers
+                .first()
+                .map(|p| p.id.clone())
+                .unwrap_or_default();
+        }
         ai.schema_token_budget = ai.schema_token_budget.clamp(500, 200_000);
         ai.request_timeout_secs = ai.request_timeout_secs.clamp(5, 600);
 

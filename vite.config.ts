@@ -2,8 +2,10 @@ import { defineConfig } from 'vitest/config';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 
 // https://tauri.app/start/frontend/vite/
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   plugins: [svelte()],
+  // Component tests mount real components, which needs Svelte's browser build.
+  resolve: mode === 'test' ? { conditions: ['browser'] } : undefined,
   clearScreen: false,
   server: {
     port: 1420,
@@ -21,4 +23,4 @@ export default defineConfig({
     environment: 'jsdom',
     include: ['src/**/*.test.ts'],
   },
-});
+}));

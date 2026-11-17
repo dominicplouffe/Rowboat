@@ -138,6 +138,36 @@ pub struct SchemaSnapshot {
     pub functions: Vec<SnapshotFunction>,
 }
 
+/// What the AI schema index needs beyond the autocomplete snapshot. Every
+/// field is best effort: a driver fills what its catalog offers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchemaDetails {
+    pub server_version: String,
+    pub tables: Vec<TableDetails>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableDetails {
+    pub schema: String,
+    pub name: String,
+    pub comment: String,
+    pub row_estimate: Option<i64>,
+    /// One short description per secondary index, e.g. `unique btree (email)`.
+    pub indexes: Vec<String>,
+    /// ClickHouse: engine, ORDER BY and partition key.
+    pub storage: String,
+    pub columns: Vec<ColumnDetails>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColumnDetails {
+    pub name: String,
+    pub nullable: bool,
+    pub comment: String,
+    /// Enum labels, or (only when asked for) a few sample values.
+    pub values: Vec<String>,
+}
+
 // ------------------------------------------------------------- streaming ----
 
 /// Receives a result row by row, for exports that must not hold the whole
@@ -151,7 +181,7 @@ pub trait RowSink: Send {
 /// What went wrong, in a form the UI and (later) the AI can act on. The
 /// distinction matters: only syntax and schema errors are sent to the AI for
 /// a suggested fix; connection and permission errors never are.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ErrorKind {
     Syntax,
@@ -326,6 +356,14 @@ pub trait Session: Send + Sync {
 
     /// Tables, columns, keys and functions for autocomplete.
     async fn snapshot(&self) -> DbResult<SchemaSnapshot>;
+
+    /// Extra catalog facts for the AI schema index. `samples` asks for a few
+    /// example values of low-cardinality columns: the only place row data can
+    /// enter an AI prompt, and off unless the user turns it on.
+    async fn details(&self, samples: bool) -> DbResult<SchemaDetails> {
+        let _ = samples;
+        Ok(SchemaDetails::default())
+    }
 
     /// Runs a statement and feeds every row to `sink` without keeping them.
     /// Returns the number of rows written.
