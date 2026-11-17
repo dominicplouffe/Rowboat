@@ -82,6 +82,10 @@ SELECT 1;
     }
     // Without settings there is no editor to wait for.
     if (loadError) reportReady();
+    // Well after startup, and only if the user has not turned it off.
+    if (settings.value && settings.value.general.updateChecks !== 'off') {
+      setTimeout(() => void ui.checkForUpdate(false), 8000);
+    }
     ipc.appInfo().then(
       (i) => (info = i),
       () => {},

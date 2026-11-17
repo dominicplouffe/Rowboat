@@ -346,3 +346,10 @@ export interface IndexInfo {
   changed: boolean;
   withSamples: boolean;
 }
+
+export interface UpdateInfo {
+  version: string;
+  /** The release page on GitHub. */
+  url: string;
+  prerelease: boolean;
+}

@@ -25,6 +25,18 @@
   let notice = $state<string | null>(null);
   let confirmingReset = $state(false);
 
+  let checkingUpdate = $state(false);
+  let updateNotice = $state<string | null>(null);
+
+  async function checkForUpdate() {
+    checkingUpdate = true;
+    const error = await ui.checkForUpdate(true);
+    checkingUpdate = false;
+    if (error) updateNotice = `The check failed: ${error}`;
+    else if (ui.update) updateNotice = `Rowboat ${ui.update.version} is available.`;
+    else updateNotice = `Rowboat ${info?.version ?? ''} is the newest version on this channel.`;
+  }
+
   // Keyboard rebinding
   let capturing = $state<string | null>(null);
   let captureError = $state<string | null>(null);
@@ -336,6 +348,25 @@
           {/if}
 
           {#if !searching && section.id === 'general'}
+            <div class="field">
+              <div class="text">
+                <span class="label">Check for updates now</span>
+                <p class="muted" role="status">
+                  {#if updateNotice}{updateNotice}{:else}You have Rowboat {info?.version ??
+                      ''}.{/if}
+                </p>
+              </div>
+              <div class="control">
+                {#if ui.update}
+                  <button class="btn" onclick={() => ipc.updateOpen(ui.update!.url)}>
+                    Open the download page
+                  </button>
+                {/if}
+                <button class="btn" disabled={checkingUpdate} onclick={checkForUpdate}>
+                  {checkingUpdate ? 'Checking…' : 'Check now'}
+                </button>
+              </div>
+            </div>
             <div class="field">
               <div class="text">
                 <span class="label">First-launch setup</span>

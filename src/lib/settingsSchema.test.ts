@@ -89,7 +89,8 @@ describe('settings schema', () => {
     expect(parseNumberField('-3', 1, 8)).toBe(1);
   });
 
-  it('settings that nothing reads yet say which milestone brings them', () => {
+  it('every setting is acted on: none is left marked as arriving later', () => {
+    expect(FIELDS.filter((f) => f.arrives)).toEqual([]);
     const working = FIELDS.filter((f) => !f.arrives).map((f) => `${f.section}.${f.key}`);
     // Everything else is stored but inert until its milestone, and is shown
     // disabled. Move a key here only when the app really acts on it.
@@ -127,6 +128,8 @@ describe('settings schema', () => {
         'results.binaryDisplay',
         'results.maxCellChars',
         'results.jsonAutoDetect',
+        'general.updateChecks',
+        'general.updateChannel',
         'ai.autoSuggestFixes',
         'ai.sendSampleValues',
         'ai.schemaTokenBudget',
