@@ -369,7 +369,10 @@ mod tests {
     fn recognises_transaction_control() {
         for (sql, want) in [
             ("BEGIN", TxControl::Begin),
-            ("  begin transaction isolation level serializable", TxControl::Begin),
+            (
+                "  begin transaction isolation level serializable",
+                TxControl::Begin,
+            ),
             ("start transaction", TxControl::Begin),
             ("-- note\ncommit", TxControl::Commit),
             ("END", TxControl::Commit),

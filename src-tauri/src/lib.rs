@@ -8,10 +8,10 @@ pub mod db;
 pub mod error;
 pub mod manager;
 pub mod secrets;
+pub mod settings;
 pub mod ssh;
 pub mod statements;
 pub mod tls;
-pub mod settings;
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -49,8 +49,14 @@ struct AppInfo {
 }
 
 #[tauri::command]
-fn app_info(app: AppHandle, store: State<'_, SettingsStore>, manager: State<'_, Manager>) -> AppInfo {
-    AppInfo {
+async fn app_info(
+    app: AppHandle,
+    store: State<'_, SettingsStore>,
+    manager: State<'_, Manager>,
+) -> Result<AppInfo> {
+    // Async on purpose: finding out whether a keychain exists can take a
+    // moment and must not run on the main thread.
+    Ok(AppInfo {
         name: "Rowboat",
         version: app.package_info().version.to_string(),
         os: std::env::consts::OS,
@@ -58,7 +64,7 @@ fn app_info(app: AppHandle, store: State<'_, SettingsStore>, manager: State<'_, 
         default_client_id: settings::default_client_id(),
         settings_path: store.path().display().to_string(),
         secrets_persistent: manager.secrets_are_persistent(),
-    }
+    })
 }
 
 /// Milliseconds since the harness launched this process, if it told us when
@@ -235,7 +241,14 @@ async fn query_run(
     confirmed: bool,
 ) -> DbResult<RunResult> {
     manager
-        .run(&connection_id, &query_id, &sql, row_limit, confirmed, &store.get())
+        .run(
+            &connection_id,
+            &query_id,
+            &sql,
+            row_limit,
+            confirmed,
+            &store.get(),
+        )
         .await
 }
 
@@ -246,7 +259,11 @@ async fn query_cancel(manager: State<'_, Manager>, query_id: String) -> DbResult
 }
 
 #[tauri::command]
-async fn transaction_end(manager: State<'_, Manager>, connection_id: String, commit: bool) -> DbResult<()> {
+async fn transaction_end(
+    manager: State<'_, Manager>,
+    connection_id: String,
+    commit: bool,
+) -> DbResult<()> {
     manager.end_transaction(&connection_id, commit).await
 }
 
@@ -260,7 +277,11 @@ async fn schema_children(
 }
 
 #[tauri::command]
-async fn schema_ddl(manager: State<'_, Manager>, connection_id: String, path: Vec<String>) -> DbResult<String> {
+async fn schema_ddl(
+    manager: State<'_, Manager>,
+    connection_id: String,
+    path: Vec<String>,
+) -> DbResult<String> {
     manager.ddl(&connection_id, &path).await
 }
 

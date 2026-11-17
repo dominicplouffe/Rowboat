@@ -175,8 +175,9 @@ impl ChSession {
         if secure {
             if !c.tls.ca_cert_path.is_empty() {
                 for der in crate::tls::certificates(&c.tls.ca_cert_path, "CA certificate")? {
-                    let cert = reqwest::Certificate::from_der(&der)
-                        .map_err(|e| DbError::connection(format!("The CA certificate is not usable: {e}")))?;
+                    let cert = reqwest::Certificate::from_der(&der).map_err(|e| {
+                        DbError::connection(format!("The CA certificate is not usable: {e}"))
+                    })?;
                     builder = builder.add_root_certificate(cert);
                 }
             }
@@ -186,14 +187,21 @@ impl ChSession {
                 _ => builder,
             };
         }
-        let http = builder
-            .build()
-            .map_err(|e| DbError::connection(format!("Could not set up the HTTP client: {}", error_text(&e))))?;
+        let http = builder.build().map_err(|e| {
+            DbError::connection(format!(
+                "Could not set up the HTTP client: {}",
+                error_text(&e)
+            ))
+        })?;
 
         let mut session = Self {
             http,
             endpoint,
-            user: if c.user.is_empty() { "default".into() } else { c.user.clone() },
+            user: if c.user.is_empty() {
+                "default".into()
+            } else {
+                c.user.clone()
+            },
             password: params.password.clone().unwrap_or_default(),
             database: c.database.clone(),
             client_id: params.client_id.clone(),
@@ -207,12 +215,15 @@ impl ChSession {
             running: Mutex::new(None),
             cancelled: Notify::new(),
         };
-        let version = session.internal("SELECT version()").await.map_err(|mut e| {
-            if matches!(e.kind, ErrorKind::Other | ErrorKind::Timeout) {
-                e.kind = ErrorKind::Connection;
-            }
-            e
-        })?;
+        let version = session
+            .internal("SELECT version()")
+            .await
+            .map_err(|mut e| {
+                if matches!(e.kind, ErrorKind::Other | ErrorKind::Timeout) {
+                    e.kind = ErrorKind::Connection;
+                }
+                e
+            })?;
         session.version = version
             .rows
             .first()
@@ -221,7 +232,14 @@ impl ChSession {
         Ok(session)
     }
 
-    fn request(&self, sql: &str, query_id: &str, row_limit: u32, level: u8, stateful: bool) -> reqwest::RequestBuilder {
+    fn request(
+        &self,
+        sql: &str,
+        query_id: &str,
+        row_limit: u32,
+        level: u8,
+        stateful: bool,
+    ) -> reqwest::RequestBuilder {
         let mut url = self.endpoint.clone();
         {
             let mut query = url.query_pairs_mut();
@@ -259,10 +277,19 @@ impl ChSession {
 
     /// Sends a statement and decodes the response, stepping down the settings
     /// level if this user may not change settings.
-    async fn run(&self, sql: &str, query_id: &str, row_limit: u32, stateful: bool) -> DbResult<QueryResult> {
+    async fn run(
+        &self,
+        sql: &str,
+        query_id: &str,
+        row_limit: u32,
+        stateful: bool,
+    ) -> DbResult<QueryResult> {
         loop {
             let level = self.settings_level.load(Ordering::SeqCst);
-            match self.run_once(sql, query_id, row_limit, level, stateful).await {
+            match self
+                .run_once(sql, query_id, row_limit, level, stateful)
+                .await
+            {
                 Err(error) if error.code.as_deref() == Some("164") && level < SETTINGS_NONE => {
                     // "Cannot modify setting in readonly mode": not a failure of
                     // the user's statement, unless it fails again without them.
@@ -281,7 +308,14 @@ impl ChSession {
         }
     }
 
-    async fn run_once(&self, sql: &str, query_id: &str, row_limit: u32, level: u8, stateful: bool) -> DbResult<QueryResult> {
+    async fn run_once(
+        &self,
+        sql: &str,
+        query_id: &str,
+        row_limit: u32,
+        level: u8,
+        stateful: bool,
+    ) -> DbResult<QueryResult> {
         let response = self
             .request(sql, query_id, row_limit, level, stateful)
             .send()
@@ -305,10 +339,15 @@ impl ChSession {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             let mut error = parse_exception(&body, exception_code.as_deref());
-            if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
                 error.kind = ErrorKind::Permission;
             }
-            if error.kind == ErrorKind::Permission && error.code.as_deref() == Some("164") && error.hint.is_none() {
+            if error.kind == ErrorKind::Permission
+                && error.code.as_deref() == Some("164")
+                && error.hint.is_none()
+            {
                 error.hint = Some("This connection is read-only.".into());
             }
             return Err(error);
@@ -350,7 +389,9 @@ impl ChSession {
         let mut ended = true;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(transport_error)?;
-            let rows = decoder.push(&chunk, want(result.rows.len())).map_err(DbError::other)?;
+            let rows = decoder
+                .push(&chunk, want(result.rows.len()))
+                .map_err(DbError::other)?;
             if over_limit(&mut result, rows) {
                 // Dropping the stream closes the connection: nothing past the
                 // limit is fetched.
@@ -359,13 +400,17 @@ impl ChSession {
             }
         }
         if ended {
-            let rows = decoder.finish(want(result.rows.len())).map_err(DbError::other)?;
+            let rows = decoder
+                .finish(want(result.rows.len()))
+                .map_err(DbError::other)?;
             over_limit(&mut result, rows);
             if let Some(text) = decoder.exception() {
                 return Err(parse_exception(&text, None));
             }
             if !result.more_available && !decoder.pending().is_empty() {
-                return Err(DbError::other("The server's response ended in the middle of a row."));
+                return Err(DbError::other(
+                    "The server's response ended in the middle of a row.",
+                ));
             }
         }
         result.columns = decoder.columns;
@@ -417,7 +462,11 @@ impl Session for ChSession {
     }
 
     async fn cancel(&self) {
-        let running = self.running.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let running = self
+            .running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let Some(query_id) = running else { return };
         // Release the caller first, then tell the server to stop working.
         self.cancelled.notify_waiters();
@@ -498,7 +547,8 @@ impl Session for ChSession {
                         if !cell(row, 3).is_empty() {
                             detail.push_str(&format!(" · PARTITION BY {}", cell(row, 3)));
                         }
-                        SchemaNode::branch(cell(row, 0), if is_view { "view" } else { "table" }).detail(detail)
+                        SchemaNode::branch(cell(row, 0), if is_view { "view" } else { "table" })
+                            .detail(detail)
                     })
                     .collect())
             }
@@ -531,7 +581,11 @@ impl Session for ChSession {
         let [database, group, name, ..] = path else {
             return Err(DbError::other("Select a table, view or dictionary."));
         };
-        let what = if group == DICTIONARIES { "DICTIONARY" } else { "TABLE" };
+        let what = if group == DICTIONARIES {
+            "DICTIONARY"
+        } else {
+            "TABLE"
+        };
         let result = self
             .internal(&format!(
                 "SHOW CREATE {what} {}.{}",
@@ -539,7 +593,11 @@ impl Session for ChSession {
                 quote_ident(DbKind::Clickhouse, name)
             ))
             .await?;
-        let statement = result.rows.first().map(|row| cell(row, 0)).unwrap_or_default();
+        let statement = result
+            .rows
+            .first()
+            .map(|row| cell(row, 0))
+            .unwrap_or_default();
         Ok(format!("{};", statement.trim_end()))
     }
 
@@ -620,7 +678,10 @@ mod tests {
             .filter_map(|line| line.split_once(": "))
             .map(|(k, v)| (k.to_lowercase(), v.to_string()))
             .collect();
-        let length: usize = headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let length: usize = headers
+            .get("content-length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         while buffer.len() < head_end + length {
             let mut chunk = [0u8; 4096];
             let n = stream.read(&mut chunk).await.ok()?;
@@ -638,7 +699,9 @@ mod tests {
     }
 
     async fn chunk(stream: &mut TcpStream, data: &[u8]) -> std::io::Result<()> {
-        stream.write_all(format!("{:x}\r\n", data.len()).as_bytes()).await?;
+        stream
+            .write_all(format!("{:x}\r\n", data.len()).as_bytes())
+            .await?;
         stream.write_all(data).await?;
         stream.write_all(b"\r\n").await
     }
@@ -653,7 +716,9 @@ mod tests {
         let (log, counter) = (seen.clone(), chunks_sent.clone());
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
                 let (log, counter, script) = (log.clone(), counter.clone(), script.clone());
                 tokio::spawn(async move {
                     while let Some(request) = read_request(&mut stream).await {
@@ -770,7 +835,13 @@ mod tests {
         let session = ChSession::connect(params(server.port)).await.unwrap();
         assert_eq!(session.server_version(), "ClickHouse 26.8.1.1");
 
-        let result = session.execute("SELECT number AS n FROM numbers(3)", ExecOptions { row_limit: 1000 }).await.unwrap();
+        let result = session
+            .execute(
+                "SELECT number AS n FROM numbers(3)",
+                ExecOptions { row_limit: 1000 },
+            )
+            .await
+            .unwrap();
         assert_eq!(result.rows.len(), 3);
         assert!(!result.more_available);
 
@@ -799,9 +870,14 @@ mod tests {
     async fn no_limit_sends_no_row_cap() {
         let server = serve(|_| Reply::Rows(numbers(5))).await;
         let session = ChSession::connect(params(server.port)).await.unwrap();
-        let result = session.execute("SELECT 1", ExecOptions { row_limit: 0 }).await.unwrap();
+        let result = session
+            .execute("SELECT 1", ExecOptions { row_limit: 0 })
+            .await
+            .unwrap();
         assert_eq!(result.rows.len(), 5);
-        assert!(!server.user_queries()[0].params.contains_key("max_result_rows"));
+        assert!(!server.user_queries()[0]
+            .params
+            .contains_key("max_result_rows"));
     }
 
     #[tokio::test]
@@ -811,7 +887,10 @@ mod tests {
 
         let started = std::time::Instant::now();
         let result = session
-            .execute("SELECT number FROM system.numbers", ExecOptions { row_limit: 1000 })
+            .execute(
+                "SELECT number FROM system.numbers",
+                ExecOptions { row_limit: 1000 },
+            )
             .await
             .unwrap();
         assert_eq!(result.rows.len(), 1000);
@@ -823,7 +902,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let sent = server.chunks_sent.load(Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(server.chunks_sent.load(Ordering::SeqCst), sent, "the stream was not closed");
+        assert_eq!(
+            server.chunks_sent.load(Ordering::SeqCst),
+            sent,
+            "the stream was not closed"
+        );
     }
 
     #[tokio::test]
@@ -832,7 +915,10 @@ mod tests {
         let mut p = params(server.port);
         p.config.read_only = true;
         let session = ChSession::connect(p).await.unwrap();
-        session.execute("SELECT 1", ExecOptions { row_limit: 10 }).await.unwrap();
+        session
+            .execute("SELECT 1", ExecOptions { row_limit: 10 })
+            .await
+            .unwrap();
         let request = &server.user_queries()[0];
         assert_eq!(request.params["readonly"], "1");
         assert!(!request.params.contains_key("session_id"));
@@ -854,13 +940,19 @@ mod tests {
         })
         .await;
         let session = ChSession::connect(params(server.port)).await.unwrap();
-        let result = session.execute("SELECT 1", ExecOptions { row_limit: 50 }).await.unwrap();
+        let result = session
+            .execute("SELECT 1", ExecOptions { row_limit: 50 })
+            .await
+            .unwrap();
         assert_eq!(result.rows.len(), 50);
         assert!(result.more_available);
 
         // The refusal is remembered: the next statement sends no settings at all.
         let before = server.user_queries().len();
-        session.execute("SELECT 2", ExecOptions { row_limit: 50 }).await.unwrap();
+        session
+            .execute("SELECT 2", ExecOptions { row_limit: 50 })
+            .await
+            .unwrap();
         let after = server.user_queries();
         assert_eq!(after.len(), before + 1, "no second probing round trip");
         assert!(!after.last().unwrap().params.contains_key("max_result_rows"));
@@ -894,15 +986,26 @@ mod tests {
         assert_eq!(syntax.kind, ErrorKind::Syntax);
         assert_eq!(syntax.position, Some(10));
         assert_eq!(syntax.code.as_deref(), Some("62"));
-        assert!(syntax.message.starts_with("Syntax error: failed at position 10"));
+        assert!(syntax
+            .message
+            .starts_with("Syntax error: failed at position 10"));
         assert!(!syntax.message.contains("version"));
 
-        let schema = session.execute("SELECT * FROM nope", all).await.unwrap_err();
+        let schema = session
+            .execute("SELECT * FROM nope", all)
+            .await
+            .unwrap_err();
         assert_eq!(schema.kind, ErrorKind::Schema);
 
-        let readonly = session.execute("INSERT INTO t VALUES (1)", all).await.unwrap_err();
+        let readonly = session
+            .execute("INSERT INTO t VALUES (1)", all)
+            .await
+            .unwrap_err();
         assert_eq!(readonly.kind, ErrorKind::Permission);
-        assert_eq!(readonly.hint.as_deref(), Some("This connection is read-only."));
+        assert_eq!(
+            readonly.hint.as_deref(),
+            Some("This connection is read-only.")
+        );
 
         let auth = session.execute("SELECT 1", all).await.unwrap_err();
         assert_eq!(auth.kind, ErrorKind::Permission);
@@ -930,7 +1033,9 @@ mod tests {
         let session = Arc::new(ChSession::connect(params(server.port)).await.unwrap());
         let runner = session.clone();
         let task = tokio::spawn(async move {
-            runner.execute("SELECT sleep(60)", ExecOptions { row_limit: 0 }).await
+            runner
+                .execute("SELECT sleep(60)", ExecOptions { row_limit: 0 })
+                .await
         });
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -942,7 +1047,10 @@ mod tests {
 
         let requests = server.user_queries();
         let query_id = &requests[0].params["query_id"];
-        assert_eq!(requests[1].sql, format!("KILL QUERY WHERE query_id = '{query_id}'"));
+        assert_eq!(
+            requests[1].sql,
+            format!("KILL QUERY WHERE query_id = '{query_id}'")
+        );
         // Cancelling when nothing runs does nothing.
         session.cancel().await;
         assert_eq!(server.user_queries().len(), 2);
@@ -953,7 +1061,10 @@ mod tests {
         let server = serve(|_| Reply::Text("JSONEachRow", "{\"n\":1}\n{\"n\":2}\n")).await;
         let session = ChSession::connect(params(server.port)).await.unwrap();
         let result = session
-            .execute("SELECT n FROM t FORMAT JSONEachRow", ExecOptions { row_limit: 100 })
+            .execute(
+                "SELECT n FROM t FORMAT JSONEachRow",
+                ExecOptions { row_limit: 100 },
+            )
             .await
             .unwrap();
         assert_eq!(result.raw.as_deref(), Some("{\"n\":1}\n{\"n\":2}\n"));
@@ -965,7 +1076,10 @@ mod tests {
         let server = serve(|_| Reply::Written(42)).await;
         let session = ChSession::connect(params(server.port)).await.unwrap();
         let result = session
-            .execute("INSERT INTO t SELECT * FROM u", ExecOptions { row_limit: 100 })
+            .execute(
+                "INSERT INTO t SELECT * FROM u",
+                ExecOptions { row_limit: 100 },
+            )
             .await
             .unwrap();
         assert_eq!(result.rows_affected, Some(42));
@@ -983,7 +1097,10 @@ mod tests {
         })
         .await;
         let session = ChSession::connect(params(server.port)).await.unwrap();
-        let error = session.execute("SELECT heavy", ExecOptions { row_limit: 0 }).await.unwrap_err();
+        let error = session
+            .execute("SELECT heavy", ExecOptions { row_limit: 0 })
+            .await
+            .unwrap_err();
         assert!(error.message.contains("Memory limit"), "{error:?}");
         assert_eq!(error.code.as_deref(), Some("241"));
     }
@@ -1026,25 +1143,39 @@ mod tests {
         })
         .await;
         let session = ChSession::connect(params(server.port)).await.unwrap();
-        let path = |parts: &[&str]| -> Vec<String> { parts.iter().map(|p| p.to_string()).collect() };
+        let path =
+            |parts: &[&str]| -> Vec<String> { parts.iter().map(|p| p.to_string()).collect() };
 
         let databases = session.children(&[]).await.unwrap();
         assert_eq!(databases.len(), 3);
         assert_eq!(databases[0].kind, "database");
 
-        let tables = session.children(&path(&["analytics", "Tables"])).await.unwrap();
+        let tables = session
+            .children(&path(&["analytics", "Tables"]))
+            .await
+            .unwrap();
         assert_eq!(
             tables[0].detail.as_deref(),
             Some("MergeTree · ORDER BY user_id, ts · PARTITION BY toYYYYMM(ts)")
         );
 
-        let columns = session.children(&path(&["analytics", "Tables", "events"])).await.unwrap();
+        let columns = session
+            .children(&path(&["analytics", "Tables", "events"]))
+            .await
+            .unwrap();
         assert_eq!(columns[0].detail.as_deref(), Some("UInt64 · sorting key"));
         assert_eq!(columns[1].detail.as_deref(), Some("Map(String, String)"));
 
-        let ddl = session.ddl(&path(&["analytics", "Tables", "events"])).await.unwrap();
+        let ddl = session
+            .ddl(&path(&["analytics", "Tables", "events"]))
+            .await
+            .unwrap();
         assert!(ddl.starts_with("CREATE TABLE analytics.events") && ddl.ends_with(';'));
-        let show = server.requests().into_iter().find(|r| r.sql.starts_with("SHOW CREATE")).unwrap();
+        let show = server
+            .requests()
+            .into_iter()
+            .find(|r| r.sql.starts_with("SHOW CREATE"))
+            .unwrap();
         assert_eq!(show.sql, "SHOW CREATE TABLE `analytics`.`events`");
         // Navigator requests stay out of the user's session.
         assert!(!show.params.contains_key("session_id"));

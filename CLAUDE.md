@@ -15,7 +15,10 @@ Built milestone by milestone (spec → "Milestones"), one branch and one PR each
     the GitHub `workflow` permission moves them to `.github/workflows/` (see the
     README there). Until then CI has never run: macOS and Windows builds are
     unverified.
-- [ ] M1 Connections — drivers, TLS/SSH, keychain secrets, run and cancel
+- [x] **M1 Connections** — three drivers, TLS, SSH tunnels, keychain secrets, run and cancel,
+      schema navigator, Prod guard
+  - ClickHouse has only been tested against a fake server and hand-encoded bytes;
+    `tests/clickhouse.rs` has never run against a real one.
 - [ ] M2 Editor — autocomplete, virtual grid, row limits at fetch, JSON viewer, history, export
 - [ ] M3 AI copilot — providers, schema index, fix on error, onboarding wizard
 - [ ] M4 Release — full perf budgets in CI, installers, docs, tag v0.1
@@ -35,7 +38,8 @@ cd src-tauri && cargo test  # Rust unit tests (needs dist/: run `npm run build` 
 cd src-tauri && cargo fmt --check && cargo clippy --all-targets --features integration -- -D warnings
 
 docker compose up -d --wait # PostgreSQL + ClickHouse for integration tests
-cd src-tauri && cargo test --features integration --test services
+eval "$(scripts/dev-sshd.sh)" # a throwaway sshd for the tunnel tests (scripts/dev-sshd.sh stop)
+cd src-tauri && cargo test --features integration   # tests/{postgres,clickhouse,ssh,services}.rs
 
 npm run tauri build         # installers for this OS, in src-tauri/target/release/bundle/
 npm run budget:bundle       # initial JS < 400 KB gzipped   (after `npm run build`)
@@ -58,11 +62,28 @@ src/                     Svelte 5 UI (runes mode). Renders only.
   lib/settings.svelte.ts Reactive mirror of the core's settings.
   lib/settingsSchema.ts  Declarative description of the Settings window (fields, search).
   lib/shortcuts.ts, actions.ts   Keyboard chords and the action registry (rebindable).
-  lib/tabs.svelte.ts     Open query tabs; each has its own row limit.
+  lib/tabs.svelte.ts     Open query tabs; each has its own row limit, connection and results.
+  lib/connections.svelte.ts  Saved connections and their open state.
+  lib/runner.ts          Which statements run, in what order; confirmation and error handling.
+  lib/schema.svelte.ts   The navigator's lazily loaded tree; SQL name/template helpers.
+  lib/dialogs.svelte.ts  Confirm prompts and the connection dialog.
   editor/sqlEditor.ts    CodeMirror 6. Lazy chunk, loaded after first paint.
-  components/            Sidebar, TabBar, Workspace, Editor, RowLimitMenu, StatusBar, SettingsDialog.
+  components/            Sidebar, SchemaNodes, TabBar, Workspace, Editor, ResultsPane, Grid,
+                         RowLimitMenu, StatusBar, SettingsDialog, ConnectionDialog, ConfirmDialog.
 src-tauri/
   src/lib.rs             Tauri setup and IPC commands.
+  src/manager.rs         Connections + secrets + tunnels + open sessions; what the commands call.
+  src/db/mod.rs          `Session` trait, result/error types shared by the drivers.
+  src/db/postgres.rs     tokio-postgres; an actor owns the connection (transaction state machine).
+  src/db/pg_types.rs     Renders PostgreSQL binary values as text.
+  src/db/clickhouse.rs   HTTP(S) via reqwest; streams and cuts at the row limit.
+  src/db/ch_rowbinary.rs Incremental RowBinaryWithNamesAndTypes decoder.
+  src/db/sqlite.rs       rusqlite on its own thread.
+  src/statements.rs      Statement splitter, transaction-control and Prod-guard detection (sqlparser tokens).
+  src/connections.rs     Connection config + the app's own SQLite file (rowboat.db).
+  src/secrets.rs         OS keychain (keyring); in-memory for the session when there is none.
+  src/ssh.rs             SSH tunnels (russh) and known_hosts checking.
+  src/tls.rs             rustls setup for the sslmode levels.
   src/settings.rs        Settings types, validation, atomic persistence. No secrets, by design.
   src/error.rs           Error type that crosses IPC as a string.
   capabilities/          What the webview may call. Keep it minimal.
@@ -85,9 +106,18 @@ regenerate it with `UPDATE_FIXTURES=1 cargo test default_settings_match`. A
 setting nothing reads yet carries `arrives: 'M1'…'M4'` in the schema and is
 shown disabled; remove the marker when the feature lands.
 
-Planned modules (do not create early): `src-tauri/src/db/` (driver trait +
-`postgres.rs`, `clickhouse.rs`, `sqlite.rs`), `src/ai/` (`openai_compat`,
-`anthropic`, `gemini`, `schema_index.rs`), `secrets.rs`, `ssh.rs`, `history.rs`.
+How a query flows: Run → `lib/runner.ts` asks the core to split the text
+(`sql_split`) and sends statements one at a time (`query_run`) exactly as
+written → `Manager::run` applies the Prod guard and the timeout → the driver
+fetches at most the tab's row limit. Errors come back as a `DbError` with a
+`kind`; only `syntax` and `schema` errors will be sent to the AI (M3).
+
+Driver rules: values leave the driver already rendered as text; the row limit
+is enforced while fetching (portal with a row count / `max_result_rows` and a
+client-side cut / stop stepping); cancel must return within a second.
+
+Planned modules (do not create early): `src-tauri/src/ai/` (`openai_compat`,
+`anthropic`, `gemini`, `schema_index.rs`), `history.rs`.
 
 ## Non-negotiables
 

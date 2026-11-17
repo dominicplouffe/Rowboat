@@ -160,7 +160,8 @@ fn execute(
     // way the user would have with BEGIN.
     let manual = !shared.auto_commit.load(Ordering::SeqCst);
     if manual && conn.is_autocommit() && tx_control(DbKind::Sqlite, sql) == TxControl::None {
-        conn.execute_batch("BEGIN").map_err(|e| map_error(e, None))?;
+        conn.execute_batch("BEGIN")
+            .map_err(|e| map_error(e, None))?;
     }
 
     let mut stmt = conn.prepare(sql).map_err(|e| map_error(e, Some(sql)))?;
@@ -176,7 +177,12 @@ fn execute(
 
     let declared: Vec<(String, String)> = stmt
         .columns()
-        .map(|c| (c.name().to_string(), c.decl_type().unwrap_or("").to_string()))
+        .map(|c| {
+            (
+                c.name().to_string(),
+                c.decl_type().unwrap_or("").to_string(),
+            )
+        })
         .collect();
     let width = declared.len();
     let limit = options.row_limit as usize;
@@ -187,10 +193,7 @@ fn execute(
     let mut seen = vec![false; width];
 
     let mut rows = stmt.raw_query();
-    loop {
-        let Some(row) = rows.next().map_err(|e| map_error(e, Some(sql)))? else {
-            break;
-        };
+    while let Some(row) = rows.next().map_err(|e| map_error(e, Some(sql)))? {
         if limit > 0 && rows_out.len() == limit {
             // One row past the limit exists; stop stepping here.
             more = true;
@@ -313,9 +316,11 @@ fn map_error(error: rusqlite::Error, sql: Option<&str>) -> DbError {
     let lower = message.to_lowercase();
     let kind = match code {
         Some(ErrorCode::OperationInterrupted) => ErrorKind::Cancelled,
-        Some(ErrorCode::ReadOnly | ErrorCode::PermissionDenied | ErrorCode::AuthorizationForStatementDenied) => {
-            ErrorKind::Permission
-        }
+        Some(
+            ErrorCode::ReadOnly
+            | ErrorCode::PermissionDenied
+            | ErrorCode::AuthorizationForStatementDenied,
+        ) => ErrorKind::Permission,
         Some(ErrorCode::CannotOpen | ErrorCode::NotADatabase) => ErrorKind::Connection,
         _ if lower.contains("syntax error") || lower.contains("incomplete input") => {
             ErrorKind::Syntax
@@ -345,8 +350,7 @@ fn map_error(error: rusqlite::Error, sql: Option<&str>) -> DbError {
             message
         },
         detail: None,
-        hint: (kind == ErrorKind::Permission)
-            .then(|| "This connection is read-only.".to_string()),
+        hint: (kind == ErrorKind::Permission).then(|| "This connection is read-only.".to_string()),
         code: code.map(|c| format!("{c:?}")),
         position,
     }
@@ -414,7 +418,8 @@ impl Session for SqliteSession {
                 .map(|(label, _, _)| SchemaNode::branch(*label, "group"))
                 .collect()),
             [group] => {
-                let Some((_, object_type, kind)) = GROUPS.iter().find(|(label, _, _)| label == group)
+                let Some((_, object_type, kind)) =
+                    GROUPS.iter().find(|(label, _, _)| label == group)
                 else {
                     return Ok(vec![]);
                 };
@@ -437,7 +442,8 @@ impl Session for SqliteSession {
                             SchemaNode::leaf(name, kind)
                         };
                         if !has_columns {
-                            node = node.detail(format!("on {}", row[1].clone().unwrap_or_default()));
+                            node =
+                                node.detail(format!("on {}", row[1].clone().unwrap_or_default()));
                         }
                         node
                     })
@@ -549,10 +555,16 @@ mod tests {
     async fn fetches_rows_as_display_text_with_column_metadata() {
         let (_dir, s) = open().await;
         seed(&s, 3).await;
-        s.execute("UPDATE t SET data = x'00ff', score = NULL WHERE id = 2", ALL)
+        s.execute(
+            "UPDATE t SET data = x'00ff', score = NULL WHERE id = 2",
+            ALL,
+        )
+        .await
+        .unwrap();
+        let r = s
+            .execute("SELECT id, name, score, data FROM t ORDER BY id", ALL)
             .await
             .unwrap();
-        let r = s.execute("SELECT id, name, score, data FROM t ORDER BY id", ALL).await.unwrap();
         let names: Vec<_> = r.columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["id", "name", "score", "data"]);
         assert_eq!(r.columns[0].kind, ColumnKind::Number);
@@ -560,7 +572,12 @@ mod tests {
         assert_eq!(r.columns[3].kind, ColumnKind::Binary);
         assert_eq!(
             r.rows[1],
-            vec![Some("2".into()), Some("row 2".into()), None, Some("\\x00ff".into())]
+            vec![
+                Some("2".into()),
+                Some("row 2".into()),
+                None,
+                Some("\\x00ff".into())
+            ]
         );
         assert_eq!(r.rows[0][2].as_deref(), Some("1.5"));
         assert!(!r.more_available);
@@ -570,11 +587,17 @@ mod tests {
     async fn row_limit_stops_stepping_and_reports_more() {
         let (_dir, s) = open().await;
         seed(&s, 50).await;
-        let r = s.execute("SELECT * FROM t", ExecOptions { row_limit: 10 }).await.unwrap();
+        let r = s
+            .execute("SELECT * FROM t", ExecOptions { row_limit: 10 })
+            .await
+            .unwrap();
         assert_eq!(r.rows.len(), 10);
         assert!(r.more_available);
 
-        let exact = s.execute("SELECT * FROM t", ExecOptions { row_limit: 50 }).await.unwrap();
+        let exact = s
+            .execute("SELECT * FROM t", ExecOptions { row_limit: 50 })
+            .await
+            .unwrap();
         assert_eq!(exact.rows.len(), 50);
         assert!(!exact.more_available, "exactly the limit is not 'more'");
     }
@@ -585,7 +608,10 @@ mod tests {
         // 10 million rows if fully stepped; must come back at once.
         let sql = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10000000) SELECT i FROM n";
         let started = std::time::Instant::now();
-        let r = s.execute(sql, ExecOptions { row_limit: 1000 }).await.unwrap();
+        let r = s
+            .execute(sql, ExecOptions { row_limit: 1000 })
+            .await
+            .unwrap();
         assert_eq!(r.rows.len(), 1000);
         assert!(r.more_available);
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -595,7 +621,10 @@ mod tests {
     async fn reports_rows_affected_for_writes_only() {
         let (_dir, s) = open().await;
         seed(&s, 5).await;
-        let update = s.execute("UPDATE t SET name = 'x' WHERE id <= 3", ALL).await.unwrap();
+        let update = s
+            .execute("UPDATE t SET name = 'x' WHERE id <= 3", ALL)
+            .await
+            .unwrap();
         assert_eq!(update.rows_affected, Some(3));
         let ddl = s.execute("CREATE TABLE u (a)", ALL).await.unwrap();
         assert!(ddl.columns.is_empty());
@@ -645,7 +674,10 @@ mod tests {
         let (dir, s) = open().await;
         seed(&s, 1).await;
         s.set_auto_commit(false);
-        let r = s.execute("INSERT INTO t (id, name) VALUES (100, 'pending')", ALL).await.unwrap();
+        let r = s
+            .execute("INSERT INTO t (id, name) VALUES (100, 'pending')", ALL)
+            .await
+            .unwrap();
         assert!(r.in_transaction && s.in_transaction());
 
         // A second connection must not see the uncommitted row.
@@ -653,16 +685,27 @@ mod tests {
         other.config.create = false;
         let peer = SqliteSession::connect(other).await.unwrap();
         let count = |r: QueryResult| r.rows[0][0].clone().unwrap();
-        assert_eq!(count(peer.execute("SELECT count(*) FROM t", ALL).await.unwrap()), "1");
+        assert_eq!(
+            count(peer.execute("SELECT count(*) FROM t", ALL).await.unwrap()),
+            "1"
+        );
 
         s.rollback().await.unwrap();
         assert!(!s.in_transaction());
-        assert_eq!(count(s.execute("SELECT count(*) FROM t", ALL).await.unwrap()), "1");
+        assert_eq!(
+            count(s.execute("SELECT count(*) FROM t", ALL).await.unwrap()),
+            "1"
+        );
         s.rollback().await.unwrap(); // the SELECT above opened a new transaction
 
-        s.execute("INSERT INTO t (id, name) VALUES (100, 'kept')", ALL).await.unwrap();
+        s.execute("INSERT INTO t (id, name) VALUES (100, 'kept')", ALL)
+            .await
+            .unwrap();
         s.commit().await.unwrap();
-        assert_eq!(count(peer.execute("SELECT count(*) FROM t", ALL).await.unwrap()), "2");
+        assert_eq!(
+            count(peer.execute("SELECT count(*) FROM t", ALL).await.unwrap()),
+            "2"
+        );
     }
 
     #[tokio::test]
@@ -674,7 +717,14 @@ mod tests {
         let mut ro = params(&dir.path().join("t.db"));
         ro.config.read_only = true;
         let s = SqliteSession::connect(ro).await.unwrap();
-        assert_eq!(s.execute("SELECT count(*) FROM t", ALL).await.unwrap().rows.len(), 1);
+        assert_eq!(
+            s.execute("SELECT count(*) FROM t", ALL)
+                .await
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
         let error = s.execute("DELETE FROM t", ALL).await.unwrap_err();
         assert_eq!(error.kind, ErrorKind::Permission);
     }
@@ -689,7 +739,11 @@ mod tests {
         assert!(error.message.contains("No such file"));
 
         let junk = dir.path().join("junk.db");
-        std::fs::write(&junk, "this is not a database, just some text padding............").unwrap();
+        std::fs::write(
+            &junk,
+            "this is not a database, just some text padding............",
+        )
+        .unwrap();
         let mut not_db = params(&junk);
         not_db.config.create = false;
         assert_eq!(
@@ -702,10 +756,20 @@ mod tests {
     async fn navigator_lists_objects_columns_and_ddl() {
         let (_dir, s) = open().await;
         seed(&s, 1).await;
-        s.execute("CREATE VIEW v AS SELECT id FROM t", ALL).await.unwrap();
-        s.execute("CREATE INDEX t_name ON t (name)", ALL).await.unwrap();
+        s.execute("CREATE VIEW v AS SELECT id FROM t", ALL)
+            .await
+            .unwrap();
+        s.execute("CREATE INDEX t_name ON t (name)", ALL)
+            .await
+            .unwrap();
 
-        let roots: Vec<_> = s.children(&[]).await.unwrap().into_iter().map(|n| n.name).collect();
+        let roots: Vec<_> = s
+            .children(&[])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
         assert_eq!(roots, ["Tables", "Views", "Indexes", "Triggers"]);
 
         let tables = s.children(&["Tables".into()]).await.unwrap();

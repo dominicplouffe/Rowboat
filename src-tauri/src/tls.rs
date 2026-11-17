@@ -15,7 +15,9 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::client::WebPkiServerVerifier;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::{CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use rustls::{
+    CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
+};
 
 use crate::connections::{Tls, TlsMode};
 use crate::db::{DbError, DbResult};
@@ -65,9 +67,9 @@ fn roots(tls: &Tls) -> DbResult<RootCertStore> {
         store.add_parsable_certificates(native.certs);
     } else {
         for cert in certificates(&tls.ca_cert_path, "CA certificate")? {
-            store
-                .add(cert)
-                .map_err(|e| DbError::connection(format!("The CA certificate is not usable: {e}")))?;
+            store.add(cert).map_err(|e| {
+                DbError::connection(format!("The CA certificate is not usable: {e}"))
+            })?;
         }
     }
     Ok(store)
@@ -187,9 +189,10 @@ pub fn client_config(tls: &Tls) -> DbResult<ClientConfig> {
             if tls.mode == TlsMode::VerifyFull {
                 builder.with_root_certificates(roots)
             } else {
-                let verifier = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider())
-                    .build()
-                    .map_err(|e| DbError::connection(format!("TLS setup failed: {e}")))?;
+                let verifier =
+                    WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider())
+                        .build()
+                        .map_err(|e| DbError::connection(format!("TLS setup failed: {e}")))?;
                 builder
                     .dangerous()
                     .with_custom_certificate_verifier(Arc::new(ChainOnly(verifier)))

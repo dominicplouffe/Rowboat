@@ -48,8 +48,13 @@ pub fn default_known_hosts_path() -> PathBuf {
 
 #[derive(Debug, Clone)]
 enum HostKeyIssue {
-    Unknown { fingerprint: String, algorithm: String },
-    Changed { line: usize },
+    Unknown {
+        fingerprint: String,
+        algorithm: String,
+    },
+    Changed {
+        line: usize,
+    },
 }
 
 struct Checker {
@@ -65,7 +70,12 @@ impl Checker {
     fn decide(&self, key: &PublicKey) -> bool {
         let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
         let report = |issue| *self.issue.lock().unwrap_or_else(|e| e.into_inner()) = Some(issue);
-        match known_hosts::check_known_hosts_path(&self.host, self.port, key, &self.known_hosts_path) {
+        match known_hosts::check_known_hosts_path(
+            &self.host,
+            self.port,
+            key,
+            &self.known_hosts_path,
+        ) {
             Ok(true) => true,
             Err(russh::keys::Error::KeyChanged { line }) => {
                 report(HostKeyIssue::Changed { line });
@@ -75,7 +85,9 @@ impl Checker {
             Ok(false) | Err(_) => {
                 let accept = match self.policy {
                     KnownHostsPolicy::AcceptNew => true,
-                    KnownHostsPolicy::Ask => self.trusted_fingerprint.as_deref() == Some(&fingerprint),
+                    KnownHostsPolicy::Ask => {
+                        self.trusted_fingerprint.as_deref() == Some(&fingerprint)
+                    }
                     KnownHostsPolicy::Strict => false,
                 };
                 if accept {
@@ -153,29 +165,38 @@ async fn authenticate(session: &mut Handle<Checker>, params: &TunnelParams) -> D
         }
         SshAuth::Key => {
             let passphrase = params.passphrase.as_deref().filter(|p| !p.is_empty());
-            let key = russh::keys::load_secret_key(&params.ssh.key_path, passphrase).map_err(|e| {
-                let text = e.to_string();
-                let encrypted = text.to_lowercase().contains("encrypt") || text.to_lowercase().contains("passphrase") || text.to_lowercase().contains("decrypt");
-                let mut error = DbError::new(
-                    ErrorKind::Permission,
-                    format!("SSH tunnel: could not load the private key {}: {text}", params.ssh.key_path),
-                );
-                if encrypted {
-                    error.hint = Some(if passphrase.is_some() {
-                        "The passphrase may be wrong.".into()
-                    } else {
-                        "This key is encrypted: enter its passphrase.".into()
-                    });
-                }
-                error
-            })?;
+            let key =
+                russh::keys::load_secret_key(&params.ssh.key_path, passphrase).map_err(|e| {
+                    let text = e.to_string();
+                    let encrypted = text.to_lowercase().contains("encrypt")
+                        || text.to_lowercase().contains("passphrase")
+                        || text.to_lowercase().contains("decrypt");
+                    let mut error = DbError::new(
+                        ErrorKind::Permission,
+                        format!(
+                            "SSH tunnel: could not load the private key {}: {text}",
+                            params.ssh.key_path
+                        ),
+                    );
+                    if encrypted {
+                        error.hint = Some(if passphrase.is_some() {
+                            "The passphrase may be wrong.".into()
+                        } else {
+                            "This key is encrypted: enter its passphrase.".into()
+                        });
+                    }
+                    error
+                })?;
             let hash = session
                 .best_supported_rsa_hash()
                 .await
                 .map_err(|e| failed("negotiation failed", e))?
                 .flatten();
             let result = session
-                .authenticate_publickey(user.clone(), PrivateKeyWithHashAlg::new(Arc::new(key), hash))
+                .authenticate_publickey(
+                    user.clone(),
+                    PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+                )
                 .await
                 .map_err(|e| failed("key authentication failed", e))?;
             if !result.success() {
@@ -201,8 +222,11 @@ async fn authenticate(session: &mut Handle<Checker>, params: &TunnelParams) -> D
                 .await
                 .map_err(|e| failed("the SSH agent did not list its keys", e))?;
             if identities.is_empty() {
-                return Err(DbError::new(ErrorKind::Permission, "SSH tunnel: the SSH agent holds no keys.")
-                    .with_hint("Add a key with ssh-add."));
+                return Err(DbError::new(
+                    ErrorKind::Permission,
+                    "SSH tunnel: the SSH agent holds no keys.",
+                )
+                .with_hint("Add a key with ssh-add."));
             }
             let hash = session
                 .best_supported_rsa_hash()
@@ -250,7 +274,10 @@ impl Tunnel {
             Err(_) => {
                 return Err(DbError::new(
                     ErrorKind::Timeout,
-                    format!("SSH tunnel: timed out connecting to {}:{}.", params.ssh.host, params.ssh.port),
+                    format!(
+                        "SSH tunnel: timed out connecting to {}:{}.",
+                        params.ssh.host, params.ssh.port
+                    ),
                 ))
             }
             Ok(Err(error)) => {
@@ -294,7 +321,12 @@ impl Tunnel {
 
         // Fail now, not at the first query, if the server refuses forwarding.
         let probe = session
-            .channel_open_direct_tcpip(params.target_host.clone(), params.target_port as u32, "127.0.0.1", local.port() as u32)
+            .channel_open_direct_tcpip(
+                params.target_host.clone(),
+                params.target_port as u32,
+                "127.0.0.1",
+                local.port() as u32,
+            )
             .await
             .map_err(|e| {
                 failed(
@@ -311,12 +343,19 @@ impl Tunnel {
         let (target_host, target_port) = (params.target_host.clone(), params.target_port as u32);
         let forwarder = tokio::spawn(async move {
             loop {
-                let Ok((mut inbound, peer)) = listener.accept().await else { break };
+                let Ok((mut inbound, peer)) = listener.accept().await else {
+                    break;
+                };
                 let session = session.clone();
                 let target_host = target_host.clone();
                 tokio::spawn(async move {
                     let Ok(channel) = session
-                        .channel_open_direct_tcpip(target_host, target_port, peer.ip().to_string(), peer.port() as u32)
+                        .channel_open_direct_tcpip(
+                            target_host,
+                            target_port,
+                            peer.ip().to_string(),
+                            peer.port() as u32,
+                        )
                         .await
                     else {
                         return;

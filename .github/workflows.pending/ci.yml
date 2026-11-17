@@ -63,7 +63,7 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
   integration:
-    name: Integration (PostgreSQL + ClickHouse)
+    name: Integration (PostgreSQL, ClickHouse, SSH)
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-22.04
     steps:
@@ -74,8 +74,15 @@ jobs:
         run: docker compose up -d --wait
       - name: Build the frontend (the Rust crate embeds dist/)
         run: npm run build
+      # A throwaway sshd on 127.0.0.1 with a fresh key, for the tunnel tests.
+      - name: Start sshd
+        run: scripts/dev-sshd.sh | sed 's/^export //' >> "$GITHUB_ENV"
+      # The PostgreSQL TLS tests need a server with certificates and are
+      # skipped here; they are run locally (see src-tauri/tests/postgres.rs).
       - name: Integration tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml --features integration --test services
+        run: >-
+          cargo test --manifest-path src-tauri/Cargo.toml --features integration
+          --test services --test postgres --test clickhouse --test ssh
       - name: Service logs
         if: failure()
         run: docker compose logs

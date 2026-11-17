@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::connections::{AppDb, ConnectionConfig, SshAuth};
-use crate::db::{self, ConnectParams, DbError, DbKind, DbResult, ErrorKind, ExecOptions, QueryResult, SchemaNode, Session};
+use crate::db::{
+    self, ConnectParams, DbError, DbKind, DbResult, ErrorKind, ExecOptions, QueryResult,
+    SchemaNode, Session,
+};
 use crate::secrets::{SecretKind, Secrets};
 use crate::settings::{ConfirmDestructive, Settings};
 use crate::ssh::{default_known_hosts_path, Tunnel, TunnelParams};
@@ -95,9 +98,11 @@ impl Manager {
             has_ssh_passphrase: self.secrets.has(&config.id, SecretKind::SshPassphrase),
             connected: open.is_some(),
             server_version: open.as_ref().map(|o| o.session.server_version()),
-            supports_transactions: open.as_ref().map_or(config.kind != DbKind::Clickhouse, |o| {
-                o.session.supports_transactions()
-            }),
+            supports_transactions: open
+                .as_ref()
+                .map_or(config.kind != DbKind::Clickhouse, |o| {
+                    o.session.supports_transactions()
+                }),
             in_transaction: open.as_ref().is_some_and(|o| o.session.in_transaction()),
             config,
         }
@@ -111,13 +116,19 @@ impl Manager {
         Ok(out)
     }
 
-    pub async fn save(&self, config: ConnectionConfig, secrets: SecretInput) -> DbResult<ConnectionView> {
+    pub async fn save(
+        &self,
+        config: ConnectionConfig,
+        secrets: SecretInput,
+    ) -> DbResult<ConnectionView> {
         let existed = !config.id.is_empty();
         let config = self.db.save(config).map_err(internal)?;
         for kind in SecretKind::ALL {
             if let Some(value) = secrets.get(kind) {
                 self.secrets.set(&config.id, kind, value).map_err(|e| {
-                    DbError::other(format!("Could not store the secret in the system keychain: {e}"))
+                    DbError::other(format!(
+                        "Could not store the secret in the system keychain: {e}"
+                    ))
                 })?;
             }
         }
@@ -139,10 +150,9 @@ impl Manager {
         match typed.get(kind) {
             Some(value) => Ok(Some(value.clone()).filter(|v| !v.is_empty())),
             None if id.is_empty() => Ok(None),
-            None => self
-                .secrets
-                .get(id, kind)
-                .map_err(|e| DbError::other(format!("Could not read from the system keychain: {e}"))),
+            None => self.secrets.get(id, kind).map_err(|e| {
+                DbError::other(format!("Could not read from the system keychain: {e}"))
+            }),
         }
     }
 
@@ -161,11 +171,15 @@ impl Manager {
                 Tunnel::open(TunnelParams {
                     ssh: config.ssh.clone(),
                     password: match config.ssh.auth {
-                        SshAuth::Password => self.secret(&config.id, SecretKind::SshPassword, typed)?,
+                        SshAuth::Password => {
+                            self.secret(&config.id, SecretKind::SshPassword, typed)?
+                        }
                         _ => None,
                     },
                     passphrase: match config.ssh.auth {
-                        SshAuth::Key => self.secret(&config.id, SecretKind::SshPassphrase, typed)?,
+                        SshAuth::Key => {
+                            self.secret(&config.id, SecretKind::SshPassphrase, typed)?
+                        }
                         _ => None,
                     },
                     target_host: config.host.clone(),
@@ -211,19 +225,31 @@ impl Manager {
         let mut config = config.validate().map_err(internal)?;
         // Testing must never create the file it is testing for.
         config.create = false;
-        let open = self.connect(&config, &typed, settings, trusted_fingerprint).await?;
+        let open = self
+            .connect(&config, &typed, settings, trusted_fingerprint)
+            .await?;
         let version = open.session.server_version();
         open.session.close().await;
         Ok(version)
     }
 
-    pub async fn open(&self, id: &str, settings: &Settings, trusted_fingerprint: Option<String>) -> DbResult<ConnectionView> {
+    pub async fn open(
+        &self,
+        id: &str,
+        settings: &Settings,
+        trusted_fingerprint: Option<String>,
+    ) -> DbResult<ConnectionView> {
         let config = self.db.get(id).map_err(internal)?;
         if self.sessions.lock().await.contains_key(id) {
             return Ok(self.view(config).await);
         }
         let open = self
-            .connect(&config, &SecretInput::default(), settings, trusted_fingerprint)
+            .connect(
+                &config,
+                &SecretInput::default(),
+                settings,
+                trusted_fingerprint,
+            )
             .await?;
         // A file created by connecting exists from now on.
         if config.create {
@@ -232,7 +258,10 @@ impl Manager {
                 ..config.clone()
             });
         }
-        self.sessions.lock().await.insert(id.to_string(), Arc::new(open));
+        self.sessions
+            .lock()
+            .await
+            .insert(id.to_string(), Arc::new(open));
         Ok(self.view(self.db.get(id).map_err(internal)?).await)
     }
 
@@ -336,8 +365,16 @@ impl Manager {
         }
     }
 
-    pub async fn children(&self, connection_id: &str, path: &[String]) -> DbResult<Vec<SchemaNode>> {
-        self.session(connection_id).await?.session.children(path).await
+    pub async fn children(
+        &self,
+        connection_id: &str,
+        path: &[String],
+    ) -> DbResult<Vec<SchemaNode>> {
+        self.session(connection_id)
+            .await?
+            .session
+            .children(path)
+            .await
     }
 
     pub async fn ddl(&self, connection_id: &str, path: &[String]) -> DbResult<String> {
@@ -368,8 +405,22 @@ mod tests {
         }
     }
 
-    async fn run(m: &Manager, id: &str, sql: &str, confirmed: bool, settings: &Settings) -> DbResult<RunResult> {
-        m.run(id, &uuid::Uuid::new_v4().to_string(), sql, 1000, confirmed, settings).await
+    async fn run(
+        m: &Manager,
+        id: &str,
+        sql: &str,
+        confirmed: bool,
+        settings: &Settings,
+    ) -> DbResult<RunResult> {
+        m.run(
+            id,
+            &uuid::Uuid::new_v4().to_string(),
+            sql,
+            1000,
+            confirmed,
+            settings,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -394,7 +445,10 @@ mod tests {
         assert!(!json.contains("hunter2"), "{json}");
 
         // Saving again without typing a password keeps it; an empty one removes it.
-        let kept = m.save(saved.config.clone(), SecretInput::default()).await.unwrap();
+        let kept = m
+            .save(saved.config.clone(), SecretInput::default())
+            .await
+            .unwrap();
         assert!(kept.has_password);
         let cleared = m
             .save(
@@ -437,9 +491,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let m = manager();
         let settings = Settings::default();
-        let id = m.save(sqlite(&dir, "a"), SecretInput::default()).await.unwrap().config.id;
+        let id = m
+            .save(sqlite(&dir, "a"), SecretInput::default())
+            .await
+            .unwrap()
+            .config
+            .id;
 
-        let closed = run(&m, &id, "SELECT 1", false, &settings).await.unwrap_err();
+        let closed = run(&m, &id, "SELECT 1", false, &settings)
+            .await
+            .unwrap_err();
         assert_eq!(closed.kind, ErrorKind::Connection);
 
         let view = m.open(&id, &settings, None).await.unwrap();
@@ -447,7 +508,9 @@ mod tests {
         assert!(view.server_version.unwrap().starts_with("SQLite"));
         assert!(!view.config.create, "the file exists now");
 
-        let result = run(&m, &id, "SELECT 40 + 2 AS answer", false, &settings).await.unwrap();
+        let result = run(&m, &id, "SELECT 40 + 2 AS answer", false, &settings)
+            .await
+            .unwrap();
         assert_eq!(result.result.rows[0][0].as_deref(), Some("42"));
 
         m.close(&id).await;
@@ -460,7 +523,12 @@ mod tests {
         let m = manager();
         let config = sqlite(&dir, "ghost");
         let error = m
-            .test(config.clone(), SecretInput::default(), &Settings::default(), None)
+            .test(
+                config.clone(),
+                SecretInput::default(),
+                &Settings::default(),
+                None,
+            )
             .await
             .unwrap_err();
         assert_eq!(error.kind, ErrorKind::Connection);
@@ -474,36 +542,75 @@ mod tests {
         let settings = Settings::default(); // confirm on Prod only
         let mut prod = sqlite(&dir, "prod");
         prod.environment = Environment::Prod;
-        let prod = m.save(prod, SecretInput::default()).await.unwrap().config.id;
-        let dev = m.save(sqlite(&dir, "dev"), SecretInput::default()).await.unwrap().config.id;
+        let prod = m
+            .save(prod, SecretInput::default())
+            .await
+            .unwrap()
+            .config
+            .id;
+        let dev = m
+            .save(sqlite(&dir, "dev"), SecretInput::default())
+            .await
+            .unwrap()
+            .config
+            .id;
         for id in [&prod, &dev] {
             m.open(id, &settings, None).await.unwrap();
-            run(&m, id, "CREATE TABLE t (id INTEGER)", false, &settings).await.unwrap();
-            run(&m, id, "INSERT INTO t VALUES (1), (2)", false, &settings).await.unwrap();
+            run(&m, id, "CREATE TABLE t (id INTEGER)", false, &settings)
+                .await
+                .unwrap();
+            run(&m, id, "INSERT INTO t VALUES (1), (2)", false, &settings)
+                .await
+                .unwrap();
         }
         let count = |r: RunResult| r.result.rows[0][0].clone().unwrap();
 
         // On Prod: refused, and nothing was deleted.
-        let refused = run(&m, &prod, "DELETE FROM t", false, &settings).await.unwrap_err();
+        let refused = run(&m, &prod, "DELETE FROM t", false, &settings)
+            .await
+            .unwrap_err();
         assert_eq!(refused.kind, ErrorKind::NeedsConfirmation);
         assert!(refused.message.contains("every row"));
-        assert_eq!(count(run(&m, &prod, "SELECT count(*) FROM t", false, &settings).await.unwrap()), "2");
+        assert_eq!(
+            count(
+                run(&m, &prod, "SELECT count(*) FROM t", false, &settings)
+                    .await
+                    .unwrap()
+            ),
+            "2"
+        );
 
         // A WHERE clause makes it an ordinary statement.
-        run(&m, &prod, "DELETE FROM t WHERE id = 1", false, &settings).await.unwrap();
+        run(&m, &prod, "DELETE FROM t WHERE id = 1", false, &settings)
+            .await
+            .unwrap();
 
         // Confirmed: runs.
-        run(&m, &prod, "DELETE FROM t", true, &settings).await.unwrap();
-        assert_eq!(count(run(&m, &prod, "SELECT count(*) FROM t", false, &settings).await.unwrap()), "0");
+        run(&m, &prod, "DELETE FROM t", true, &settings)
+            .await
+            .unwrap();
+        assert_eq!(
+            count(
+                run(&m, &prod, "SELECT count(*) FROM t", false, &settings)
+                    .await
+                    .unwrap()
+            ),
+            "0"
+        );
 
         // On Dev the default setting does not ask.
-        run(&m, &dev, "DELETE FROM t", false, &settings).await.unwrap();
+        run(&m, &dev, "DELETE FROM t", false, &settings)
+            .await
+            .unwrap();
 
         // "Always" asks everywhere; "Never" asks nowhere.
         let mut always = Settings::default();
         always.execution.confirm_destructive = ConfirmDestructive::Always;
         assert_eq!(
-            run(&m, &dev, "DROP TABLE t", false, &always).await.unwrap_err().kind,
+            run(&m, &dev, "DROP TABLE t", false, &always)
+                .await
+                .unwrap_err()
+                .kind,
             ErrorKind::NeedsConfirmation
         );
         let mut never = Settings::default();
@@ -517,7 +624,12 @@ mod tests {
         let m = manager();
         let mut settings = Settings::default();
         settings.execution.query_timeout_secs = 1;
-        let id = m.save(sqlite(&dir, "slow"), SecretInput::default()).await.unwrap().config.id;
+        let id = m
+            .save(sqlite(&dir, "slow"), SecretInput::default())
+            .await
+            .unwrap()
+            .config
+            .id;
         m.open(&id, &settings, None).await.unwrap();
 
         let started = Instant::now();
@@ -534,13 +646,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let m = Arc::new(manager());
         let settings = Settings::default();
-        let id = m.save(sqlite(&dir, "c"), SecretInput::default()).await.unwrap().config.id;
+        let id = m
+            .save(sqlite(&dir, "c"), SecretInput::default())
+            .await
+            .unwrap()
+            .config
+            .id;
         m.open(&id, &settings, None).await.unwrap();
 
         let (runner, connection) = (m.clone(), id.clone());
         let task = tokio::spawn(async move {
             let endless = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT count(*) FROM n";
-            runner.run(&connection, "query-1", endless, 1000, false, &Settings::default()).await
+            runner
+                .run(
+                    &connection,
+                    "query-1",
+                    endless,
+                    1000,
+                    false,
+                    &Settings::default(),
+                )
+                .await
         });
         tokio::time::sleep(Duration::from_millis(200)).await;
         m.cancel("some-other-query").await; // unknown id: nothing happens
@@ -554,12 +680,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let m = manager();
         let mut settings = Settings::default();
-        let id = m.save(sqlite(&dir, "tx"), SecretInput::default()).await.unwrap().config.id;
+        let id = m
+            .save(sqlite(&dir, "tx"), SecretInput::default())
+            .await
+            .unwrap()
+            .config
+            .id;
         m.open(&id, &settings, None).await.unwrap();
-        run(&m, &id, "CREATE TABLE t (id INTEGER)", false, &settings).await.unwrap();
+        run(&m, &id, "CREATE TABLE t (id INTEGER)", false, &settings)
+            .await
+            .unwrap();
 
         settings.execution.auto_commit = false;
-        let r = run(&m, &id, "INSERT INTO t VALUES (1)", false, &settings).await.unwrap();
+        let r = run(&m, &id, "INSERT INTO t VALUES (1)", false, &settings)
+            .await
+            .unwrap();
         assert!(r.result.in_transaction);
         assert!(m.list().await.unwrap()[0].in_transaction);
         m.end_transaction(&id, false).await.unwrap();

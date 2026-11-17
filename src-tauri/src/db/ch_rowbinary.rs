@@ -32,11 +32,17 @@ pub enum Type {
     DateTime64(u32),
     Time,
     Time64(u32),
-    Decimal { bytes: usize, scale: usize },
+    Decimal {
+        bytes: usize,
+        scale: usize,
+    },
     Uuid,
     Ipv4,
     Ipv6,
-    Enum { bytes: usize, names: HashMap<i16, String> },
+    Enum {
+        bytes: usize,
+        names: HashMap<i16, String>,
+    },
     Nullable(Box<Type>),
     Array(Box<Type>),
     Tuple(Vec<Type>),
@@ -247,12 +253,18 @@ pub fn column_kind(ty: &Type) -> ColumnKind {
             ColumnKind::Number
         }
         Type::Bool => ColumnKind::Bool,
-        Type::Date | Type::Date32 | Type::DateTime | Type::DateTime64(_) | Type::Time | Type::Time64(_) => {
-            ColumnKind::Temporal
-        }
-        Type::String | Type::FixedString(_) | Type::Uuid | Type::Enum { .. } | Type::Ipv4 | Type::Ipv6 => {
-            ColumnKind::Text
-        }
+        Type::Date
+        | Type::Date32
+        | Type::DateTime
+        | Type::DateTime64(_)
+        | Type::Time
+        | Type::Time64(_) => ColumnKind::Temporal,
+        Type::String
+        | Type::FixedString(_)
+        | Type::Uuid
+        | Type::Enum { .. }
+        | Type::Ipv4
+        | Type::Ipv6 => ColumnKind::Text,
         Type::Nullable(inner) => column_kind(inner),
         _ => ColumnKind::Other,
     }
@@ -382,7 +394,10 @@ fn float(value: f64, text: String) -> String {
 fn date_from_days(days: i64) -> String {
     NaiveDate::from_ymd_opt(1970, 1, 1)
         .and_then(|epoch| epoch.checked_add_signed(chrono::Duration::days(days)))
-        .map_or_else(|| format!("{days} days from 1970-01-01"), |d| d.format("%Y-%m-%d").to_string())
+        .map_or_else(
+            || format!("{days} days from 1970-01-01"),
+            |d| d.format("%Y-%m-%d").to_string(),
+        )
 }
 
 /// Timestamps are shown in UTC.
@@ -460,7 +475,12 @@ fn value(ty: &Type, r: &mut Reader, nested: bool) -> Decoded<Option<String>> {
             let unit = 10i64.pow((*precision).min(18));
             let mut out = clock(ticks / unit);
             if *precision > 0 {
-                let _ = write!(out, ".{:0width$}", (ticks % unit).abs(), width = *precision as usize);
+                let _ = write!(
+                    out,
+                    ".{:0width$}",
+                    (ticks % unit).abs(),
+                    width = *precision as usize
+                );
             }
             quoted(out)
         }
@@ -594,7 +614,10 @@ fn exception_at(data: &[u8]) -> Sniff {
             }
         }
         if i == 0 {
-            let digits = data[pos..].iter().take_while(|b| b.is_ascii_digit()).count();
+            let digits = data[pos..]
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
             if digits == 0 || digits > 6 {
                 return if pos + digits == data.len() && digits <= 6 {
                     Sniff::NeedMore
@@ -761,7 +784,9 @@ mod tests {
         let mut data = header(&[("c", type_name)]);
         data.extend_from_slice(bytes);
         let mut decoder = Decoder::new();
-        let rows = decoder.push(&data, 0).unwrap_or_else(|e| panic!("{type_name}: {e}"));
+        let rows = decoder
+            .push(&data, 0)
+            .unwrap_or_else(|e| panic!("{type_name}: {e}"));
         assert_eq!(rows.len(), 1, "{type_name}");
         assert!(decoder.pending().is_empty(), "{type_name}: bytes left over");
         rows[0][0].clone()
@@ -783,9 +808,18 @@ mod tests {
         assert_eq!(text("Int8", &[0xff]), "-1");
         assert_eq!(text("UInt16", &1000u16.to_le_bytes()), "1000");
         assert_eq!(text("Int32", &(-123456i32).to_le_bytes()), "-123456");
-        assert_eq!(text("UInt64", &u64::MAX.to_le_bytes()), "18446744073709551615");
-        assert_eq!(text("Int64", &i64::MIN.to_le_bytes()), "-9223372036854775808");
-        assert_eq!(text("UInt128", &u128::MAX.to_le_bytes()), u128::MAX.to_string());
+        assert_eq!(
+            text("UInt64", &u64::MAX.to_le_bytes()),
+            "18446744073709551615"
+        );
+        assert_eq!(
+            text("Int64", &i64::MIN.to_le_bytes()),
+            "-9223372036854775808"
+        );
+        assert_eq!(
+            text("UInt128", &u128::MAX.to_le_bytes()),
+            u128::MAX.to_string()
+        );
         assert_eq!(text("Int128", &(-5i128).to_le_bytes()), "-5");
 
         let mut max256 = [0xffu8; 32];
@@ -827,7 +861,10 @@ mod tests {
     fn dates_and_times_in_utc() {
         assert_eq!(text("Date", &19782u16.to_le_bytes()), "2024-02-29");
         assert_eq!(text("Date32", &(-1i32).to_le_bytes()), "1969-12-31");
-        assert_eq!(text("DateTime", &1709212455u32.to_le_bytes()), "2024-02-29 13:14:15");
+        assert_eq!(
+            text("DateTime", &1709212455u32.to_le_bytes()),
+            "2024-02-29 13:14:15"
+        );
         assert_eq!(
             text("DateTime('Europe/Paris')", &1709212455u32.to_le_bytes()),
             "2024-02-29 13:14:15"
@@ -840,14 +877,20 @@ mod tests {
             text("DateTime64(6, 'UTC')", &(-1i64).to_le_bytes()),
             "1969-12-31 23:59:59.999999"
         );
-        assert_eq!(text("DateTime64(0)", &60i64.to_le_bytes()), "1970-01-01 00:01:00");
+        assert_eq!(
+            text("DateTime64(0)", &60i64.to_le_bytes()),
+            "1970-01-01 00:01:00"
+        );
     }
 
     #[test]
     fn decimals_place_the_point_by_scale() {
         assert_eq!(text("Decimal(9, 2)", &12345i32.to_le_bytes()), "123.45");
         assert_eq!(text("Decimal(18, 4)", &(-5i64).to_le_bytes()), "-0.0005");
-        assert_eq!(text("Decimal(38, 10)", &10_000_000_000i128.to_le_bytes()), "1");
+        assert_eq!(
+            text("Decimal(38, 10)", &10_000_000_000i128.to_le_bytes()),
+            "1"
+        );
         assert_eq!(text("Decimal64(3)", &1500i64.to_le_bytes()), "1.5");
         let mut wide = [0u8; 32];
         wide[..4].copy_from_slice(&12345u32.to_le_bytes());
@@ -862,7 +905,13 @@ mod tests {
         uuid.extend(0x907ba6006ad3dba0u64.to_le_bytes());
         assert_eq!(text("UUID", &uuid), "61f0c404-5cb3-11e7-907b-a6006ad3dba0");
 
-        assert_eq!(text("IPv4", &u32::from(Ipv4Addr::new(192, 168, 1, 10)).to_le_bytes()), "192.168.1.10");
+        assert_eq!(
+            text(
+                "IPv4",
+                &u32::from(Ipv4Addr::new(192, 168, 1, 10)).to_le_bytes()
+            ),
+            "192.168.1.10"
+        );
         let v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
         assert_eq!(text("IPv6", &v6.octets()), "2001:db8::1");
     }
@@ -873,7 +922,11 @@ mod tests {
         assert_eq!(text("Enum8('a' = -1, 'b, c' = 2)", &[2]), "b, c");
         assert_eq!(text("Enum8('a' = -1, 'b' = 2)", &[0xff]), "a");
         assert_eq!(text("Enum16('big' = 1000)", &1000i16.to_le_bytes()), "big");
-        assert_eq!(text("Enum8('a' = 1)", &[9]), "9", "an unknown value shows its number");
+        assert_eq!(
+            text("Enum8('a' = 1)", &[9]),
+            "9",
+            "an unknown value shows its number"
+        );
     }
 
     #[test]
@@ -927,17 +980,23 @@ mod tests {
 
     #[test]
     fn wrappers_and_parameters_are_understood() {
-        assert_eq!(parse_type("SimpleAggregateFunction(sum, UInt64)").unwrap(), Type::UInt(8));
+        assert_eq!(
+            parse_type("SimpleAggregateFunction(sum, UInt64)").unwrap(),
+            Type::UInt(8)
+        );
         assert_eq!(parse_type("IntervalDay").unwrap(), Type::Int(8));
         assert_eq!(
             parse_type("Nested(a UInt8, b String)").unwrap(),
             Type::Array(Box::new(Type::Tuple(vec![Type::UInt(1), Type::String])))
         );
         assert_eq!(
-            parse_type("Map(LowCardinality(String), Array(Nullable(DateTime64(3, 'UTC'))))").unwrap(),
+            parse_type("Map(LowCardinality(String), Array(Nullable(DateTime64(3, 'UTC'))))")
+                .unwrap(),
             Type::Map(
                 Box::new(Type::String),
-                Box::new(Type::Array(Box::new(Type::Nullable(Box::new(Type::DateTime64(3))))))
+                Box::new(Type::Array(Box::new(Type::Nullable(Box::new(
+                    Type::DateTime64(3)
+                )))))
             )
         );
     }
@@ -952,7 +1011,11 @@ mod tests {
 
     #[test]
     fn rows_arrive_across_arbitrary_chunk_boundaries() {
-        let mut data = header(&[("id", "UInt32"), ("name", "String"), ("tags", "Array(String)")]);
+        let mut data = header(&[
+            ("id", "UInt32"),
+            ("name", "String"),
+            ("tags", "Array(String)"),
+        ]);
         for i in 0..50u32 {
             data.extend(i.to_le_bytes());
             string(&format!("name {i}"), &mut data);
@@ -1007,7 +1070,10 @@ mod tests {
             rows.extend(decoder.finish(0).unwrap());
             assert_eq!(rows.len(), 2, "chunk size {chunk}");
             let text = decoder.exception().expect("exception detected");
-            assert!(text.starts_with("Code: 241. DB::Exception: Memory limit"), "{text}");
+            assert!(
+                text.starts_with("Code: 241. DB::Exception: Memory limit"),
+                "{text}"
+            );
         }
     }
 
@@ -1015,7 +1081,9 @@ mod tests {
     fn the_tagged_exception_block_is_detected_too() {
         let mut data = header(&[("n", "UInt8")]);
         data.push(7);
-        data.extend_from_slice(b"\r\n__exception__\r\nabcdefghijklmnop\r\nCode: 395. DB::Exception: boom\r\n");
+        data.extend_from_slice(
+            b"\r\n__exception__\r\nabcdefghijklmnop\r\nCode: 395. DB::Exception: boom\r\n",
+        );
         let mut decoder = Decoder::new();
         assert_eq!(decoder.push(&data, 0).unwrap().len(), 1);
         assert!(decoder.exception().unwrap().contains("Code: 395"));

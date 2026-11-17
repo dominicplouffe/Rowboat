@@ -1,7 +1,7 @@
 //! SSH tunnel tests against a real sshd, forwarding to the PostgreSQL test
 //! server.
 //!
-//!     scripts/dev-sshd.sh        # prints the variables to export
+//!     eval "$(scripts/dev-sshd.sh)"     # starts sshd and exports the variables
 //!     cargo test --features integration --test ssh
 //!
 //! Needs `ROWBOAT_TEST_SSH_PORT`, `ROWBOAT_TEST_SSH_USER` and
@@ -45,7 +45,9 @@ fn target() -> Option<Target> {
 }
 
 fn pg_port() -> u16 {
-    env("ROWBOAT_TEST_PG_PORT").and_then(|p| p.parse().ok()).unwrap_or(5432)
+    env("ROWBOAT_TEST_PG_PORT")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5432)
 }
 
 fn params(target: &Target, known_hosts: &Path) -> TunnelParams {
@@ -96,7 +98,10 @@ async fn query_through(tunnel: &Tunnel) -> String {
     .await
     .expect("connect through the tunnel");
     let result = session
-        .execute("SELECT count(*) FROM generate_series(1, 100000)", ExecOptions { row_limit: 0 })
+        .execute(
+            "SELECT count(*) FROM generate_series(1, 100000)",
+            ExecOptions { row_limit: 0 },
+        )
         .await
         .unwrap();
     result.rows[0][0].clone().unwrap()
@@ -106,7 +111,9 @@ async fn query_through(tunnel: &Tunnel) -> String {
 async fn key_authentication_forwards_queries() {
     let Some(target) = target() else { return };
     let dir = tempfile::tempdir().unwrap();
-    let tunnel = Tunnel::open(params(&target, &dir.path().join("known_hosts"))).await.unwrap();
+    let tunnel = Tunnel::open(params(&target, &dir.path().join("known_hosts")))
+        .await
+        .unwrap();
     assert!(tunnel.local.ip().is_loopback());
     assert_eq!(query_through(&tunnel).await, "100000");
 }
@@ -115,16 +122,27 @@ async fn key_authentication_forwards_queries() {
 async fn several_connections_share_one_tunnel() {
     let Some(target) = target() else { return };
     let dir = tempfile::tempdir().unwrap();
-    let tunnel = Tunnel::open(params(&target, &dir.path().join("known_hosts"))).await.unwrap();
-    let (a, b, c) = tokio::join!(query_through(&tunnel), query_through(&tunnel), query_through(&tunnel));
-    assert_eq!((a.as_str(), b.as_str(), c.as_str()), ("100000", "100000", "100000"));
+    let tunnel = Tunnel::open(params(&target, &dir.path().join("known_hosts")))
+        .await
+        .unwrap();
+    let (a, b, c) = tokio::join!(
+        query_through(&tunnel),
+        query_through(&tunnel),
+        query_through(&tunnel)
+    );
+    assert_eq!(
+        (a.as_str(), b.as_str(), c.as_str()),
+        ("100000", "100000", "100000")
+    );
 }
 
 #[tokio::test]
 async fn closing_the_tunnel_closes_the_local_port() {
     let Some(target) = target() else { return };
     let dir = tempfile::tempdir().unwrap();
-    let tunnel = Tunnel::open(params(&target, &dir.path().join("known_hosts"))).await.unwrap();
+    let tunnel = Tunnel::open(params(&target, &dir.path().join("known_hosts")))
+        .await
+        .unwrap();
     let local = tunnel.local;
     drop(tunnel);
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -155,8 +173,10 @@ async fn password_authentication() {
 #[tokio::test]
 async fn encrypted_key_needs_its_passphrase() {
     let Some(target) = target() else { return };
-    let (Some(key), Some(passphrase)) = (env("ROWBOAT_TEST_SSH_ENCRYPTED_KEY"), env("ROWBOAT_TEST_SSH_PASSPHRASE"))
-    else {
+    let (Some(key), Some(passphrase)) = (
+        env("ROWBOAT_TEST_SSH_ENCRYPTED_KEY"),
+        env("ROWBOAT_TEST_SSH_PASSPHRASE"),
+    ) else {
         eprintln!("skipped: set ROWBOAT_TEST_SSH_ENCRYPTED_KEY and _PASSPHRASE");
         return;
     };
@@ -227,7 +247,9 @@ async fn unknown_host_keys_follow_the_policy() {
     trusted.policy = KnownHostsPolicy::Ask;
     trusted.trusted_fingerprint = Some(fingerprint);
     Tunnel::open(trusted).await.unwrap();
-    assert!(std::fs::read_to_string(&known_hosts).unwrap().contains("ssh-"));
+    assert!(std::fs::read_to_string(&known_hosts)
+        .unwrap()
+        .contains("ssh-"));
 
     // Now even Strict connects, because the key is known.
     let mut strict = params(&target, &known_hosts);
@@ -249,7 +271,11 @@ async fn a_changed_host_key_is_always_refused() {
         ),
     )
     .unwrap();
-    for policy in [KnownHostsPolicy::AcceptNew, KnownHostsPolicy::Ask, KnownHostsPolicy::Strict] {
+    for policy in [
+        KnownHostsPolicy::AcceptNew,
+        KnownHostsPolicy::Ask,
+        KnownHostsPolicy::Strict,
+    ] {
         let mut p = params(&target, &known_hosts);
         p.policy = policy;
         let error = Tunnel::open(p).await.err().unwrap();

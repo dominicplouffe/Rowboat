@@ -161,8 +161,12 @@ impl ConnectionConfig {
                 if self.port == 0 {
                     return Err(Error::Other("Enter a port.".into()));
                 }
-                if self.ssh.enabled && (self.ssh.host.trim().is_empty() || self.ssh.user.trim().is_empty()) {
-                    return Err(Error::Other("The SSH tunnel needs a host and a user.".into()));
+                if self.ssh.enabled
+                    && (self.ssh.host.trim().is_empty() || self.ssh.user.trim().is_empty())
+                {
+                    return Err(Error::Other(
+                        "The SSH tunnel needs a host and a user.".into(),
+                    ));
                 }
             }
         }
@@ -198,7 +202,10 @@ impl AppDb {
     }
 
     pub fn in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory().map_err(db_err)?, PathBuf::new())
+        Self::init(
+            Connection::open_in_memory().map_err(db_err)?,
+            PathBuf::new(),
+        )
     }
 
     fn init(conn: Connection, path: PathBuf) -> Result<Self> {

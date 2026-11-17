@@ -64,7 +64,11 @@ pub fn render(ty: &Type, raw: &[u8]) -> String {
 
 fn fallback(raw: &[u8]) -> String {
     match std::str::from_utf8(raw) {
-        Ok(text) if !text.chars().any(|c| c.is_control() && c != '\n' && c != '\t') => {
+        Ok(text)
+            if !text
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t') =>
+        {
             text.to_string()
         }
         _ => hex(raw),
@@ -97,19 +101,24 @@ impl<'a> Reader<'a> {
         self.take(2).map(|b| u16::from_be_bytes([b[0], b[1]]))
     }
     fn i32(&mut self) -> Option<i32> {
-        self.take(4).map(|b| i32::from_be_bytes(b.try_into().unwrap()))
+        self.take(4)
+            .map(|b| i32::from_be_bytes(b.try_into().unwrap()))
     }
     fn u32(&mut self) -> Option<u32> {
-        self.take(4).map(|b| u32::from_be_bytes(b.try_into().unwrap()))
+        self.take(4)
+            .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
     }
     fn i64(&mut self) -> Option<i64> {
-        self.take(8).map(|b| i64::from_be_bytes(b.try_into().unwrap()))
+        self.take(8)
+            .map(|b| i64::from_be_bytes(b.try_into().unwrap()))
     }
     fn f32(&mut self) -> Option<f32> {
-        self.take(4).map(|b| f32::from_be_bytes(b.try_into().unwrap()))
+        self.take(4)
+            .map(|b| f32::from_be_bytes(b.try_into().unwrap()))
     }
     fn f64(&mut self) -> Option<f64> {
-        self.take(8).map(|b| f64::from_be_bytes(b.try_into().unwrap()))
+        self.take(8)
+            .map(|b| f64::from_be_bytes(b.try_into().unwrap()))
     }
     /// A length-prefixed field; `None` inside means SQL NULL.
     fn field(&mut self) -> Option<Option<&'a [u8]>> {
@@ -183,7 +192,11 @@ fn decode(ty: &Type, raw: &[u8]) -> Option<String> {
             let mut out = String::with_capacity(bits);
             for i in 0..bits {
                 let byte = *r.0.get(i / 8)?;
-                out.push(if byte & (0x80 >> (i % 8)) != 0 { '1' } else { '0' });
+                out.push(if byte & (0x80 >> (i % 8)) != 0 {
+                    '1'
+                } else {
+                    '0'
+                });
             }
             out
         }
@@ -199,8 +212,9 @@ fn decode(ty: &Type, raw: &[u8]) -> Option<String> {
         "vector" => {
             let dims = r.u16()?;
             r.u16()?;
-            let values: Option<Vec<String>> =
-                (0..dims).map(|_| r.f32().map(|f| float(f as f64, true))).collect();
+            let values: Option<Vec<String>> = (0..dims)
+                .map(|_| r.f32().map(|f| float(f as f64, true)))
+                .collect();
             format!("[{}]", values?.join(","))
         }
         _ => return None,
@@ -297,7 +311,7 @@ fn money(cents: i64) -> String {
     let units = (abs / 100).to_string();
     let mut grouped = String::new();
     for (i, c) in units.chars().enumerate() {
-        if i > 0 && (units.len() - i) % 3 == 0 {
+        if i > 0 && (units.len() - i).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(c);
@@ -307,7 +321,14 @@ fn money(cents: i64) -> String {
 
 fn uuid(b: &[u8]) -> String {
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
 }
 
 fn epoch() -> NaiveDate {
@@ -440,7 +461,10 @@ fn inet(r: &mut Reader) -> Option<String> {
     let len = r.u8()? as usize;
     let addr = r.take(len)?;
     let (text, full) = match (family, len) {
-        (2, 4) => (Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]).to_string(), 32),
+        (2, 4) => (
+            Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]).to_string(),
+            32,
+        ),
         (3, 16) => {
             let bytes: [u8; 16] = addr.try_into().ok()?;
             (Ipv6Addr::from(bytes).to_string(), 128)
@@ -554,8 +578,16 @@ fn range(element: &Type, r: &mut Reader) -> Option<String> {
     let upper = bound(flags & UPPER_INFINITE != 0)?;
     Some(format!(
         "{}{lower},{upper}{}",
-        if flags & LOWER_INCLUSIVE != 0 { '[' } else { '(' },
-        if flags & UPPER_INCLUSIVE != 0 { ']' } else { ')' },
+        if flags & LOWER_INCLUSIVE != 0 {
+            '['
+        } else {
+            '('
+        },
+        if flags & UPPER_INCLUSIVE != 0 {
+            ']'
+        } else {
+            ')'
+        },
     ))
 }
 
@@ -639,7 +671,10 @@ mod tests {
         assert_eq!(time(3_723_500_000), "01:02:03.5");
         assert_eq!(timestamp(0, true), "2000-01-01 00:00:00+00");
         assert_eq!(timestamp(-1, false), "1999-12-31 23:59:59.999999");
-        assert_eq!(interval(14, 3, 3_600_000_000), "1 year 2 mons 3 days 01:00:00");
+        assert_eq!(
+            interval(14, 3, 3_600_000_000),
+            "1 year 2 mons 3 days 01:00:00"
+        );
         assert_eq!(interval(0, 0, 0), "00:00:00");
         assert_eq!(interval(0, 1, -1_500_000), "1 day -00:00:01.5");
         assert_eq!(zone(19_800), "+05:30");

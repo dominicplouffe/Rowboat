@@ -11,7 +11,7 @@
 //! and the UI says so. There is deliberately no file fallback.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -74,7 +74,12 @@ pub struct Memory(Mutex<HashMap<String, String>>);
 
 impl Backend for Memory {
     fn get(&self, account: &str) -> Result<Option<String>, String> {
-        Ok(self.0.lock().unwrap_or_else(|e| e.into_inner()).get(account).cloned())
+        Ok(self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(account)
+            .cloned())
     }
     fn set(&self, account: &str, secret: &str) -> Result<(), String> {
         self.0
@@ -84,50 +89,64 @@ impl Backend for Memory {
         Ok(())
     }
     fn delete(&self, account: &str) -> Result<(), String> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).remove(account);
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(account);
         Ok(())
     }
 }
 
 pub struct Secrets {
-    backend: Box<dyn Backend>,
-    /// False when secrets only last until the app quits.
-    persistent: bool,
+    /// Chosen on first use: probing the keychain can take a moment, and it
+    /// must never be part of app startup.
+    chosen: OnceLock<(Box<dyn Backend>, bool)>,
+    probe: fn() -> (Box<dyn Backend>, bool),
+}
+
+fn probe_system() -> (Box<dyn Backend>, bool) {
+    let keychain = Keychain;
+    // A harmless round trip tells us whether a keychain is really there.
+    let probe = "rowboat-keychain-probe";
+    if keychain.set(probe, "ok").is_ok() && keychain.delete(probe).is_ok() {
+        (Box::new(keychain), true)
+    } else {
+        (Box::new(Memory::default()), false)
+    }
 }
 
 impl Secrets {
     /// Uses the OS keychain when it works, memory otherwise.
     pub fn system() -> Self {
-        let keychain = Keychain;
-        // A harmless round trip tells us whether a keychain is really there.
-        let probe = "rowboat-keychain-probe";
-        let usable = keychain.set(probe, "ok").is_ok() && keychain.delete(probe).is_ok();
-        if usable {
-            Self {
-                backend: Box::new(keychain),
-                persistent: true,
-            }
-        } else {
-            Self::in_memory()
+        Self {
+            chosen: OnceLock::new(),
+            probe: probe_system,
         }
     }
 
     pub fn in_memory() -> Self {
         Self {
-            backend: Box::new(Memory::default()),
-            persistent: false,
+            chosen: OnceLock::new(),
+            probe: || (Box::new(Memory::default()), false),
         }
     }
 
     pub fn with_backend(backend: Box<dyn Backend>) -> Self {
-        Self {
-            backend,
-            persistent: true,
-        }
+        let secrets = Self {
+            chosen: OnceLock::new(),
+            probe: || unreachable!("the backend was given"),
+        };
+        let _ = secrets.chosen.set((backend, true));
+        secrets
     }
 
+    fn backend(&self) -> &dyn Backend {
+        self.chosen.get_or_init(self.probe).0.as_ref()
+    }
+
+    /// False when secrets only last until the app quits.
     pub fn is_persistent(&self) -> bool {
-        self.persistent
+        self.chosen.get_or_init(self.probe).1
     }
 
     fn account(connection_id: &str, kind: SecretKind) -> String {
@@ -135,16 +154,16 @@ impl Secrets {
     }
 
     pub fn get(&self, connection_id: &str, kind: SecretKind) -> Result<Option<String>, String> {
-        self.backend.get(&Self::account(connection_id, kind))
+        self.backend().get(&Self::account(connection_id, kind))
     }
 
     /// Stores a secret; an empty one deletes it.
     pub fn set(&self, connection_id: &str, kind: SecretKind, secret: &str) -> Result<(), String> {
         let account = Self::account(connection_id, kind);
         if secret.is_empty() {
-            self.backend.delete(&account)
+            self.backend().delete(&account)
         } else {
-            self.backend.set(&account, secret)
+            self.backend().set(&account, secret)
         }
     }
 
@@ -155,7 +174,7 @@ impl Secrets {
     /// Removes every secret of a deleted connection.
     pub fn forget(&self, connection_id: &str) {
         for kind in SecretKind::ALL {
-            let _ = self.backend.delete(&Self::account(connection_id, kind));
+            let _ = self.backend().delete(&Self::account(connection_id, kind));
         }
     }
 }
@@ -168,11 +187,19 @@ mod tests {
     fn secrets_are_kept_per_connection_and_kind() {
         let secrets = Secrets::in_memory();
         secrets.set("a", SecretKind::Password, "pw-a").unwrap();
-        secrets.set("a", SecretKind::SshPassphrase, "phrase").unwrap();
+        secrets
+            .set("a", SecretKind::SshPassphrase, "phrase")
+            .unwrap();
         secrets.set("b", SecretKind::Password, "pw-b").unwrap();
 
-        assert_eq!(secrets.get("a", SecretKind::Password).unwrap().as_deref(), Some("pw-a"));
-        assert_eq!(secrets.get("b", SecretKind::Password).unwrap().as_deref(), Some("pw-b"));
+        assert_eq!(
+            secrets.get("a", SecretKind::Password).unwrap().as_deref(),
+            Some("pw-a")
+        );
+        assert_eq!(
+            secrets.get("b", SecretKind::Password).unwrap().as_deref(),
+            Some("pw-b")
+        );
         assert_eq!(secrets.get("a", SecretKind::SshPassword).unwrap(), None);
         assert!(secrets.has("a", SecretKind::SshPassphrase));
     }

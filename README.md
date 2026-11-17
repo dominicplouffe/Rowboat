@@ -20,10 +20,10 @@ back rows.
 - **Safe by default.** Secrets live in the OS keychain. No account, no telemetry, no crash reports.
 - **Bring your own model.** Any major LLM provider, or a local model with no key at all.
 
-> **Status: early development.** Milestone M0 (foundation) is in place: the app
-> shell, settings, themes, the SQL editor, and build pipelines for every
-> platform. Database connections arrive next. See the full plan in
-> [docs/SPEC.md](docs/SPEC.md).
+> **Status: early development.** You can connect to PostgreSQL, ClickHouse and
+> SQLite (with TLS and SSH tunnels), browse the schema, and run and cancel
+> queries with a fetch-time row limit. Autocomplete, paging, editing, export and
+> the AI copilot come next. See the full plan in [docs/SPEC.md](docs/SPEC.md).
 
 ## Build from source
 

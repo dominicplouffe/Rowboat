@@ -70,7 +70,13 @@ pub struct PgSession {
 /// Looks a password up in a pgpass file's contents.
 /// Format: `host:port:database:user:password`, `*` matches anything, `\`
 /// escapes `:` and `\`.
-pub fn pgpass_lookup(contents: &str, host: &str, port: u16, database: &str, user: &str) -> Option<String> {
+pub fn pgpass_lookup(
+    contents: &str,
+    host: &str,
+    port: u16,
+    database: &str,
+    user: &str,
+) -> Option<String> {
     for line in contents.lines() {
         let line = line.trim_end_matches('\r');
         if line.is_empty() || line.starts_with('#') {
@@ -109,8 +115,11 @@ fn pgpass_file() -> Option<std::path::PathBuf> {
         return Some(path.into());
     }
     if cfg!(windows) {
-        std::env::var_os("APPDATA")
-            .map(|dir| std::path::PathBuf::from(dir).join("postgresql").join("pgpass.conf"))
+        std::env::var_os("APPDATA").map(|dir| {
+            std::path::PathBuf::from(dir)
+                .join("postgresql")
+                .join("pgpass.conf")
+        })
     } else {
         std::env::var_os("HOME").map(|dir| std::path::PathBuf::from(dir).join(".pgpass"))
     }
@@ -155,9 +164,10 @@ fn map_error(error: tokio_postgres::Error) -> DbError {
                 db.message().to_string()
             },
             detail: db.detail().map(str::to_string),
-            hint: db.hint().map(str::to_string).or_else(|| {
-                (code == "25006").then(|| "This connection is read-only.".to_string())
-            }),
+            hint: db
+                .hint()
+                .map(str::to_string)
+                .or_else(|| (code == "25006").then(|| "This connection is read-only.".to_string())),
             code: Some(code.to_string()),
             position,
         };
@@ -168,8 +178,17 @@ fn map_error(error: tokio_postgres::Error) -> DbError {
     }
     let lower = message.to_lowercase();
     let connectionish = [
-        "connect", "tls", "certificate", "timed out", "refused", "reset", "broken pipe", "eof",
-        "dns", "resolve", "handshake",
+        "connect",
+        "tls",
+        "certificate",
+        "timed out",
+        "refused",
+        "reset",
+        "broken pipe",
+        "eof",
+        "dns",
+        "resolve",
+        "handshake",
     ]
     .iter()
     .any(|needle| lower.contains(needle));
@@ -206,7 +225,11 @@ where
     });
 }
 
-async fn connect_with<T>(config: &Config, tls: T, shared: &Arc<Shared>) -> Result<Client, tokio_postgres::Error>
+async fn connect_with<T>(
+    config: &Config,
+    tls: T,
+    shared: &Arc<Shared>,
+) -> Result<Client, tokio_postgres::Error>
 where
     T: MakeTlsConnect<Socket> + 'static,
     T::Stream: Send,
@@ -219,8 +242,16 @@ where
 
 async fn open(params: &ConnectParams, shared: &Arc<Shared>) -> DbResult<Client> {
     let c = &params.config;
-    let user = if c.user.is_empty() { "postgres" } else { &c.user };
-    let database = if c.database.is_empty() { user } else { &c.database };
+    let user = if c.user.is_empty() {
+        "postgres"
+    } else {
+        &c.user
+    };
+    let database = if c.database.is_empty() {
+        user
+    } else {
+        &c.database
+    };
 
     let mut config = Config::new();
     config
@@ -233,13 +264,17 @@ async fn open(params: &ConnectParams, shared: &Arc<Shared>) -> DbResult<Client> 
         .application_name(&params.client_id)
         .connect_timeout(params.connect_timeout);
 
-    let password = params.password.clone().filter(|p| !p.is_empty()).or_else(|| {
-        if !c.use_pgpass {
-            return None;
-        }
-        let contents = std::fs::read_to_string(pgpass_file()?).ok()?;
-        pgpass_lookup(&contents, &c.host, c.port, database, user)
-    });
+    let password = params
+        .password
+        .clone()
+        .filter(|p| !p.is_empty())
+        .or_else(|| {
+            if !c.use_pgpass {
+                return None;
+            }
+            let contents = std::fs::read_to_string(pgpass_file()?).ok()?;
+            pgpass_lookup(&contents, &c.host, c.port, database, user)
+        });
     if let Some(password) = password {
         config.password(password);
     }
@@ -267,10 +302,7 @@ async fn open(params: &ConnectParams, shared: &Arc<Shared>) -> DbResult<Client> 
                 SslMode::Require
             });
             let tls = MakeRustlsConnect::new(crate::tls::client_config(&c.tls)?);
-            (
-                connect_with(&config, tls.clone(), shared).await,
-                Some(tls),
-            )
+            (connect_with(&config, tls.clone(), shared).await, Some(tls))
         }
     };
     let client = client.map_err(|e| {
@@ -280,7 +312,8 @@ async fn open(params: &ConnectParams, shared: &Arc<Shared>) -> DbResult<Client> 
         }
         error
     })?;
-    *shared.cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some((client.cancel_token(), rustls));
+    *shared.cancel.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((client.cancel_token(), rustls));
     Ok(client)
 }
 
@@ -333,7 +366,11 @@ fn is_stream_copy(sql: &str) -> bool {
     upper.starts_with("COPY") && (upper.contains("STDIN") || upper.contains("STDOUT"))
 }
 
-async fn fetch(tx: &Transaction<'_>, sql: &str, options: ExecOptions) -> Result<QueryResult, tokio_postgres::Error> {
+async fn fetch(
+    tx: &Transaction<'_>,
+    sql: &str,
+    options: ExecOptions,
+) -> Result<QueryResult, tokio_postgres::Error> {
     let statement = tx.prepare(sql).await?;
     if statement.columns().is_empty() {
         let affected = tx.execute(&statement, &[]).await?;
@@ -355,7 +392,11 @@ async fn fetch(tx: &Transaction<'_>, sql: &str, options: ExecOptions) -> Result<
     // The server-side cursor: ask the portal for one row more than the limit,
     // so "more available" is known without fetching the rest.
     let limit = options.row_limit as usize;
-    let ask = if limit == 0 { 0 } else { (limit + 1).min(i32::MAX as usize) as i32 };
+    let ask = if limit == 0 {
+        0
+    } else {
+        (limit + 1).min(i32::MAX as usize) as i32
+    };
     let portal = tx.bind(&statement, &[]).await?;
     let stream = tx.query_portal_raw(&portal, ask).await?;
     pin_mut!(stream);
@@ -383,7 +424,11 @@ async fn fetch(tx: &Transaction<'_>, sql: &str, options: ExecOptions) -> Result<
 }
 
 /// Runs a statement outside any user transaction.
-async fn run_auto_commit(client: &mut Client, sql: &str, options: ExecOptions) -> Result<QueryResult, tokio_postgres::Error> {
+async fn run_auto_commit(
+    client: &mut Client,
+    sql: &str,
+    options: ExecOptions,
+) -> Result<QueryResult, tokio_postgres::Error> {
     let statement = client.prepare(sql).await?;
     if statement.columns().is_empty() {
         let affected = client.execute(&statement, &[]).await?;
@@ -398,7 +443,11 @@ async fn run_auto_commit(client: &mut Client, sql: &str, options: ExecOptions) -
     Ok(result)
 }
 
-fn finish(result: Result<QueryResult, tokio_postgres::Error>, shared: &Shared, in_transaction: bool) -> DbResult<QueryResult> {
+fn finish(
+    result: Result<QueryResult, tokio_postgres::Error>,
+    shared: &Shared,
+    in_transaction: bool,
+) -> DbResult<QueryResult> {
     let notices = shared.take_notices();
     result
         .map(|mut r| {
@@ -421,18 +470,18 @@ fn note(text: &str, in_transaction: bool) -> QueryResult {
 fn transaction_modes(begin_sql: &str) -> Option<String> {
     let text = begin_sql.trim().trim_end_matches(';').trim();
     let upper = text.to_ascii_uppercase();
-    let rest = if let Some(rest) = upper.strip_prefix("BEGIN") {
-        &text[text.len() - rest.len()..]
-    } else if let Some(rest) = upper.strip_prefix("START TRANSACTION") {
-        &text[text.len() - rest.len()..]
-    } else {
-        return None;
-    };
-    let rest = rest.trim();
+    let after = ["BEGIN", "START TRANSACTION"]
+        .iter()
+        .find_map(|prefix| upper.strip_prefix(prefix))?;
+    let rest = text[text.len() - after.len()..].trim();
     let rest_upper = rest.to_ascii_uppercase();
     let rest = ["TRANSACTION", "WORK"]
         .iter()
-        .find_map(|word| rest_upper.strip_prefix(word).map(|r| &rest[rest.len() - r.len()..]))
+        .find_map(|word| {
+            rest_upper
+                .strip_prefix(word)
+                .map(|r| &rest[rest.len() - r.len()..])
+        })
         .unwrap_or(rest)
         .trim();
     (!rest.is_empty()).then(|| format!("SET TRANSACTION {rest}"))
@@ -451,7 +500,9 @@ async fn serve(
             let attempt = if params.auto_reconnect {
                 open(&params, &shared).await
             } else {
-                Err(DbError::connection("The connection to the server was lost."))
+                Err(DbError::connection(
+                    "The connection to the server was lost.",
+                ))
             };
             match attempt {
                 Ok(fresh) => {
@@ -508,11 +559,19 @@ async fn serve(
                         ))));
                     }
                     TxControl::Begin => {
-                        in_transaction(&mut client, &mut inbox, &shared, Some(&sql), None, reply).await;
+                        in_transaction(&mut client, &mut inbox, &shared, Some(&sql), None, reply)
+                            .await;
                     }
                     TxControl::None if manual => {
-                        in_transaction(&mut client, &mut inbox, &shared, None, Some((sql, options)), reply)
-                            .await;
+                        in_transaction(
+                            &mut client,
+                            &mut inbox,
+                            &shared,
+                            None,
+                            Some((sql, options)),
+                            reply,
+                        )
+                        .await;
                     }
                     TxControl::None => {
                         let result = run_auto_commit(&mut client, &sql, options).await;
@@ -554,8 +613,8 @@ async fn in_transaction(
     let _ = reply.send(finish(opening, shared, !lost));
 
     let mut tx = Some(tx);
-    while !lost {
-        let Some(command) = inbox.recv().await else { break };
+    // If the connection was lost while opening, there is nothing to serve.
+    while let Some(command) = if lost { None } else { inbox.recv().await } {
         let current = tx.as_ref().expect("transaction is open");
         match command {
             Command::Close => break,
@@ -566,14 +625,21 @@ async fn in_transaction(
             }
             Command::EndTransaction { commit, reply } => {
                 let tx = tx.take().expect("transaction is open");
-                let result = if commit { tx.commit().await } else { tx.rollback().await };
+                let result = if commit {
+                    tx.commit().await
+                } else {
+                    tx.rollback().await
+                };
                 shared.take_notices();
                 let _ = reply.send(result.map_err(map_error));
                 break;
             }
             Command::Execute(sql, options, reply) => match tx_control(DbKind::Postgres, &sql) {
                 TxControl::Begin => {
-                    let _ = reply.send(Ok(note("There is already a transaction in progress.", true)));
+                    let _ = reply.send(Ok(note(
+                        "There is already a transaction in progress.",
+                        true,
+                    )));
                 }
                 control @ (TxControl::Commit | TxControl::Rollback) => {
                     let tx = tx.take().expect("transaction is open");
@@ -582,7 +648,11 @@ async fn in_transaction(
                     } else {
                         tx.rollback().await
                     };
-                    let _ = reply.send(finish(result.map(|()| QueryResult::default()), shared, false));
+                    let _ = reply.send(finish(
+                        result.map(|()| QueryResult::default()),
+                        shared,
+                        false,
+                    ));
                     break;
                 }
                 TxControl::None => {
@@ -663,7 +733,12 @@ impl Session for PgSession {
     }
 
     async fn cancel(&self) {
-        let token = self.shared.cancel.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let token = self
+            .shared
+            .cancel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if let Some((token, tls)) = token {
             let _ = match tls {
                 Some(tls) => token.cancel_query(tls).await,
@@ -769,7 +844,9 @@ impl Session for PgSession {
                             .await?;
                         Ok(rows
                             .iter()
-                            .map(|row| SchemaNode::leaf(cell(row, 0), "function").detail(cell(row, 1)))
+                            .map(|row| {
+                                SchemaNode::leaf(cell(row, 0), "function").detail(cell(row, 1))
+                            })
                             .collect())
                     }
                     TYPES => {
@@ -823,16 +900,21 @@ impl Session for PgSession {
 
     async fn ddl(&self, path: &[String]) -> DbResult<String> {
         let [schema, group, name, ..] = path else {
-            return Err(DbError::other("Select a table, view, function, sequence or type."));
+            return Err(DbError::other(
+                "Select a table, view, function, sequence or type.",
+            ));
         };
         let qualified = format!("{}.{}", ident(schema), ident(name));
         let regclass = format!("{}::regclass", lit(&qualified));
-        let one = |rows: Vec<Vec<Option<String>>>| rows.first().map(|r| cell(r, 0)).unwrap_or_default();
+        let one =
+            |rows: Vec<Vec<Option<String>>>| rows.first().map(|r| cell(r, 0)).unwrap_or_default();
 
         match group.as_str() {
             VIEWS | MATVIEWS => {
                 let body = one(self
-                    .catalog(format!("SELECT pg_catalog.pg_get_viewdef({regclass}, true)"))
+                    .catalog(format!(
+                        "SELECT pg_catalog.pg_get_viewdef({regclass}, true)"
+                    ))
                     .await?);
                 let head = if group == VIEWS {
                     "CREATE OR REPLACE VIEW"
@@ -853,7 +935,8 @@ impl Session for PgSession {
                     .await
                     .map_err(|mut e| {
                         if e.message.contains("aggregate") {
-                            e.message = "PostgreSQL cannot print the definition of an aggregate.".into();
+                            e.message =
+                                "PostgreSQL cannot print the definition of an aggregate.".into();
                         }
                         e
                     })?;
@@ -903,7 +986,9 @@ impl Session for PgSession {
                     "e" => format!("CREATE TYPE {qualified} AS ENUM ({});", cell(row, 1)),
                     "d" => format!("CREATE DOMAIN {qualified} AS {};", cell(row, 2)),
                     "c" => format!("CREATE TYPE {qualified} AS ({});", cell(row, 3)),
-                    _ => format!("-- {qualified} is a range type; its definition is not reconstructed yet."),
+                    _ => format!(
+                        "-- {qualified} is a range type; its definition is not reconstructed yet."
+                    ),
                 })
             }
             TABLES => {
@@ -957,7 +1042,9 @@ impl Session for PgSession {
                 }
                 Ok(ddl)
             }
-            _ => Err(DbError::other("Select a table, view, function, sequence or type.")),
+            _ => Err(DbError::other(
+                "Select a table, view, function, sequence or type.",
+            )),
         }
     }
 
@@ -980,19 +1067,28 @@ mod tests {
             pgpass_lookup(file, "db.example.com", 5432, "app", "alice").as_deref(),
             Some("s3cret")
         );
-        assert_eq!(pgpass_lookup(file, "anything", 1, "x", "bob").as_deref(), Some("bobpw"));
+        assert_eq!(
+            pgpass_lookup(file, "anything", 1, "x", "bob").as_deref(),
+            Some("bobpw")
+        );
         assert_eq!(
             pgpass_lookup(file, "localhost", 5433, "any", "carol").as_deref(),
             Some("with:colon\\slash")
         );
-        assert_eq!(pgpass_lookup(file, "db.example.com", 5432, "other", "alice"), None);
+        assert_eq!(
+            pgpass_lookup(file, "db.example.com", 5432, "other", "alice"),
+            None
+        );
         assert_eq!(pgpass_lookup("garbage line\n", "h", 1, "d", "u"), None);
     }
 
     #[test]
     fn first_matching_pgpass_line_wins() {
         let file = "*:*:*:u:first\nhost:1:d:u:second\n";
-        assert_eq!(pgpass_lookup(file, "host", 1, "d", "u").as_deref(), Some("first"));
+        assert_eq!(
+            pgpass_lookup(file, "host", 1, "d", "u").as_deref(),
+            Some("first")
+        );
     }
 
     #[test]
