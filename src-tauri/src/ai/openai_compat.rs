@@ -13,7 +13,6 @@ use super::{
 const AZURE_API_VERSION: &str = "2024-10-21";
 
 fn authorize(endpoint: &Endpoint, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    let builder = builder.timeout(endpoint.timeout);
     match (&endpoint.key, endpoint.kind) {
         (Some(key), ProviderKind::Azure) => builder.header("api-key", key),
         (Some(key), _) => builder.bearer_auth(key),
@@ -30,7 +29,8 @@ pub async fn list_models(http: &reqwest::Client, endpoint: &Endpoint) -> AiResul
             vec![endpoint.deployment.clone()]
         });
     }
-    let builder = authorize(endpoint, http.get(format!("{}/models", endpoint.base_url)));
+    let builder = authorize(endpoint, http.get(format!("{}/models", endpoint.base_url)))
+        .timeout(endpoint.timeout);
     let response = builder.send().await.map_err(super::transport_error)?;
     if !response.status().is_success() {
         return Err(status_error(response).await);
@@ -81,10 +81,10 @@ pub async fn stream_chat(
     let url = chat_url(endpoint);
     let post =
         |with_usage: bool| authorize(endpoint, http.post(&url).json(&body(chat, with_usage)));
-    let mut response = send(post(true), cancel).await?;
+    let mut response = send(post(true), cancel, endpoint.timeout).await?;
     if matches!(response.status().as_u16(), 400 | 422) {
         // Some compatible servers reject `stream_options`; usage is optional.
-        let retry = send(post(false), cancel).await?;
+        let retry = send(post(false), cancel, endpoint.timeout).await?;
         if retry.status().is_success() {
             response = retry;
         }
@@ -94,7 +94,7 @@ pub async fn stream_chat(
     }
 
     let mut usage = Usage::default();
-    read_sse(response, cancel, |data| {
+    read_sse(response, cancel, endpoint.timeout, |data| {
         if data.trim() == "[DONE]" {
             return Ok(false);
         }

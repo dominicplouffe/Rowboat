@@ -20,8 +20,7 @@ fn request(
 ) -> reqwest::RequestBuilder {
     let mut builder = http
         .request(method, format!("{}{path}", endpoint.base_url))
-        .header("anthropic-version", API_VERSION)
-        .timeout(endpoint.timeout);
+        .header("anthropic-version", API_VERSION);
     if let Some(key) = &endpoint.key {
         builder = builder.header("x-api-key", key);
     }
@@ -33,8 +32,9 @@ pub async fn list_models(http: &reqwest::Client, endpoint: &Endpoint) -> AiResul
     let mut after: Option<String> = None;
     // Paginated; a handful of pages at most.
     for _ in 0..10 {
-        let mut builder =
-            request(http, endpoint, reqwest::Method::GET, "/v1/models").query(&[("limit", "1000")]);
+        let mut builder = request(http, endpoint, reqwest::Method::GET, "/v1/models")
+            .query(&[("limit", "1000")])
+            .timeout(endpoint.timeout);
         if let Some(id) = &after {
             builder = builder.query(&[("after_id", id)]);
         }
@@ -76,13 +76,13 @@ pub async fn stream_chat(
     on_delta: &mut (dyn FnMut(&str) + Send),
 ) -> AiResult<Usage> {
     let builder = request(http, endpoint, reqwest::Method::POST, "/v1/messages").json(&body(chat));
-    let response = send(builder, cancel).await?;
+    let response = send(builder, cancel, endpoint.timeout).await?;
     if !response.status().is_success() {
         return Err(status_error(response).await);
     }
     let mut usage = Usage::default();
     let mut wrote = false;
-    read_sse(response, cancel, |data| {
+    read_sse(response, cancel, endpoint.timeout, |data| {
         let Ok(event) = serde_json::from_str::<Value>(data) else {
             return Ok(true);
         };

@@ -409,6 +409,7 @@ export const FIELDS: Field[] = [
     min: 5,
     max: 600,
     unit: 'seconds',
+    help: 'How long the provider may stay silent before a request is given up. An answer that keeps arriving is never cut off.',
     keywords: 'llm provider',
   },
 

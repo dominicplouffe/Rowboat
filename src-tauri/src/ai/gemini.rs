@@ -14,9 +14,7 @@ fn request(
     method: reqwest::Method,
     path: &str,
 ) -> reqwest::RequestBuilder {
-    let mut builder = http
-        .request(method, format!("{}{path}", endpoint.base_url))
-        .timeout(endpoint.timeout);
+    let mut builder = http.request(method, format!("{}{path}", endpoint.base_url));
     if let Some(key) = &endpoint.key {
         // In a header, never in the query string, so it cannot end up in a log.
         builder = builder.header("x-goog-api-key", key);
@@ -29,7 +27,8 @@ pub async fn list_models(http: &reqwest::Client, endpoint: &Endpoint) -> AiResul
     let mut page: Option<String> = None;
     for _ in 0..10 {
         let mut builder = request(http, endpoint, reqwest::Method::GET, "/v1beta/models")
-            .query(&[("pageSize", "1000")]);
+            .query(&[("pageSize", "1000")])
+            .timeout(endpoint.timeout);
         if let Some(token) = &page {
             builder = builder.query(&[("pageToken", token)]);
         }
@@ -76,12 +75,12 @@ pub async fn stream_chat(
     let builder = request(http, endpoint, reqwest::Method::POST, &path)
         .query(&[("alt", "sse")])
         .json(&body(chat));
-    let response = send(builder, cancel).await?;
+    let response = send(builder, cancel, endpoint.timeout).await?;
     if !response.status().is_success() {
         return Err(status_error(response).await);
     }
     let mut usage = Usage::default();
-    read_sse(response, cancel, |data| {
+    read_sse(response, cancel, endpoint.timeout, |data| {
         let Ok(event) = serde_json::from_str::<Value>(data) else {
             return Ok(true);
         };

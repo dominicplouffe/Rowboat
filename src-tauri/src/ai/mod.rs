@@ -231,14 +231,17 @@ pub(crate) async fn status_error(response: reqwest::Response) -> AiError {
 pub(crate) async fn read_sse(
     response: reqwest::Response,
     cancel: &Notify,
+    idle: Duration,
     mut on_event: impl FnMut(&str) -> AiResult<bool>,
 ) -> AiResult<()> {
     let mut stream = response.bytes_stream();
     let mut parser = SseParser::default();
     loop {
+        // The timeout is on silence, not on the whole answer: a long answer
+        // that keeps arriving is fine, a stalled one is not.
         let chunk = tokio::select! {
             _ = cancel.notified() => return Err(AiError::cancelled()),
-            chunk = stream.next() => chunk,
+            chunk = tokio::time::timeout(idle, stream.next()) => chunk.map_err(|_| timed_out())?,
         };
         match chunk {
             Some(Ok(bytes)) => {
@@ -259,14 +262,25 @@ pub(crate) async fn read_sse(
     }
 }
 
-/// Sends a request, racing it against cancellation.
+fn timed_out() -> AiError {
+    AiError::new(
+        AiErrorKind::Timeout,
+        "The AI provider did not answer in time.",
+    )
+}
+
+/// Sends a request, racing it against cancellation and the time allowed for
+/// the provider to start answering.
 pub(crate) async fn send(
     request: reqwest::RequestBuilder,
     cancel: &Notify,
+    wait: Duration,
 ) -> AiResult<reqwest::Response> {
     tokio::select! {
         _ = cancel.notified() => Err(AiError::cancelled()),
-        response = request.send() => response.map_err(transport_error),
+        response = tokio::time::timeout(wait, request.send()) => {
+            response.map_err(|_| timed_out())?.map_err(transport_error)
+        }
     }
 }
 

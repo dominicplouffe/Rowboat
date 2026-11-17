@@ -744,3 +744,17 @@ async fn a_base_url_that_is_not_a_web_address_is_refused_before_any_request() {
     }
     assert!(seen.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_stream_that_goes_silent_times_out_but_a_slow_steady_one_does_not() {
+    let mut stalled = sse(&[r#"{"choices":[{"delta":{"content":"part"}}]}"#]);
+    stalled.hang = true;
+    let (base, _) = serve(vec![stalled]).await;
+    let mut quick = endpoint(ProviderKind::Openai, &base);
+    quick.timeout = Duration::from_millis(400);
+    let started = std::time::Instant::now();
+    let (result, text) = stream(&quick).await;
+    assert_eq!(result.unwrap_err().kind, AiErrorKind::Timeout);
+    assert_eq!(text, "part");
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
