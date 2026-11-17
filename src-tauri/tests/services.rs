@@ -57,10 +57,17 @@ fn clickhouse_http_interface_answers_ping() {
     let addr = env_or("ROWBOAT_TEST_CLICKHOUSE", "127.0.0.1:8123");
     let mut stream = connect(&addr);
     stream
-        .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .write_all(b"GET /ping HTTP/1.0\r\nHost: localhost\r\n\r\n")
         .unwrap();
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
-    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    assert!(response.trim_end().ends_with("Ok."), "{response}");
+    // The body may arrive plain or chunked depending on the server version, so
+    // look at the status line and for the body text rather than at exact bytes.
+    let status = response.lines().next().unwrap_or_default();
+    assert!(
+        status.starts_with("HTTP/1.") && status.contains(" 200"),
+        "{response}"
+    );
+    let body = response.split_once("\r\n\r\n").map_or("", |(_, body)| body);
+    assert!(body.contains("Ok."), "{response}");
 }

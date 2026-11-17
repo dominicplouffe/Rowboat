@@ -4,7 +4,9 @@
 //
 // The app is launched several times with ROWBOAT_BENCH_OUT set. In that mode
 // it writes the time from process start to the first painted, usable window to
-// that file and exits. It is a local measurement: nothing is sent anywhere.
+// that file and exits. The clock starts when this script spawns the process
+// and stops when the SQL editor is loaded and painted, so it covers process
+// creation, loading the webview, and the lazily loaded editor. It is a local measurement: nothing is sent anywhere.
 //
 // Budgets (override with env vars):
 //   STARTUP_BUDGET_MS      default 1000 — the spec's target on a 2021+ laptop.
@@ -34,7 +36,18 @@ function findBinary() {
   const target = join(root, 'src-tauri/target');
   const candidates = [join(target, 'release', exe)];
   if (existsSync(target)) {
-    for (const entry of readdirSync(target)) candidates.push(join(target, entry, 'release', exe));
+    // With `--target universal-apple-darwin` there is one directory per
+    // architecture. Measure the one that runs natively here (never the other
+    // architecture under emulation), in an order that does not depend on the
+    // filesystem's directory listing.
+    const native = process.arch === 'arm64' ? 'aarch64-' : 'x86_64-';
+    const triples = readdirSync(target).sort();
+    for (const entry of triples.filter((e) => e.startsWith(native))) {
+      candidates.push(join(target, entry, 'release', exe));
+    }
+    for (const entry of triples.filter((e) => !e.startsWith(native))) {
+      candidates.push(join(target, entry, 'release', exe));
+    }
   }
   return candidates.find(existsSync) ?? candidates[0];
 }
@@ -97,6 +110,8 @@ function launch(index, { sampleMemory }) {
       env: {
         ...process.env,
         ROWBOAT_BENCH_OUT: out,
+        // The clock starts here, before the process exists.
+        ROWBOAT_BENCH_T0: String(Date.now()),
         ROWBOAT_BENCH_IDLE_MS: sampleMemory ? String(IDLE_MS) : '0',
         // Fresh settings every run: a true first launch, and nothing of the
         // developer's own config is touched.

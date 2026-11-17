@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import type { SqlEditor } from '../editor/sqlEditor';
+  import { reportReady } from '../lib/ready';
   import { settings } from '../lib/settings.svelte';
   import { tabs } from '../lib/tabs.svelte';
 
@@ -19,7 +20,9 @@
           if (tab) tab.text = text;
         });
       })
-      .catch(() => (failed = true));
+      .catch(() => (failed = true))
+      // Usable means you can type SQL: only now is the app "started".
+      .finally(reportReady);
     return () => {
       destroyed = true;
       editor?.destroy();
@@ -27,9 +30,13 @@
   });
 
   // Follow the active tab.
+  // Depends only on which tab is active: reading the tab's text here would
+  // re-run this (and refocus the editor) on every keystroke.
   $effect(() => {
-    const tab = tabs.active;
-    if (!editor || !tab) return;
+    const id = tabs.activeId;
+    if (!editor) return;
+    const tab = untrack(() => tabs.active);
+    if (!tab || tab.id !== id) return;
     editor.show(tab.id, tab.text);
     editor.focus();
   });

@@ -31,7 +31,7 @@ while (queue.length) {
   initial.add(file);
   const code = readFileSync(join(dist, file), 'utf8');
   const statics = code.matchAll(
-    /(?:^|[;\n}])\s*(?:import|export)\s*(?:[^"'()]*?\sfrom\s*)?["'](\.[^"']+\.js)["']/g,
+    /(?:^|[;\n}])\s*(?:import|export)\s*(?:[^"'()]*?\bfrom\s*)?["'](\.[^"']+\.js)["']/g,
   );
   for (const [, spec] of statics) queue.push(posix.join(posix.dirname(file), spec));
 }

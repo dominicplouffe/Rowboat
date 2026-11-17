@@ -2,7 +2,14 @@
   import { onMount } from 'svelte';
   import { ACTIONS } from '../lib/actions';
   import { settings } from '../lib/settings.svelte';
-  import { FIELDS, matchesQuery, SECTIONS, type Field } from '../lib/settingsSchema';
+  import {
+    FIELDS,
+    matchesQuery,
+    MILESTONE_NAMES,
+    parseNumberField,
+    SECTIONS,
+    type Field,
+  } from '../lib/settingsSchema';
   import { chordFor, chordFromEvent, formatChord, isBindable } from '../lib/shortcuts';
   import { ipc } from '../lib/ipc';
   import type { AppInfo, SectionId } from '../lib/types';
@@ -112,10 +119,12 @@
   }
 
   function setNumber(field: Field & { kind: 'number' }, input: HTMLInputElement) {
-    const parsed = Math.round(Number(input.value));
-    const value = Number.isFinite(parsed)
-      ? Math.min(field.max, Math.max(field.min, parsed))
-      : (settings.getDynamic(field.section, field.key) as number);
+    const value = parseNumberField(input.value, field.min, field.max);
+    if (value === null) {
+      // Empty or not a number: put the stored value back rather than guess.
+      input.value = String(settings.getDynamic(field.section, field.key));
+      return;
+    }
     input.value = String(value);
     settings.setDynamic(field.section, field.key, value);
   }
@@ -213,6 +222,11 @@
             <div class="field">
               <div class="text">
                 <label for={id}>{field.label}</label>
+                {#if field.arrives}
+                  <span class="badge" title={`Takes effect with ${MILESTONE_NAMES[field.arrives]}`}>
+                    Arrives in {field.arrives}
+                  </span>
+                {/if}
                 {#if field.help}<p class="muted">{field.help}</p>{/if}
               </div>
               <div class="control">
@@ -220,6 +234,7 @@
                   <input
                     {id}
                     class="switch"
+                    disabled={!!field.arrives}
                     type="checkbox"
                     role="switch"
                     checked={value as boolean}
@@ -230,6 +245,7 @@
                   <select
                     {id}
                     class="input"
+                    disabled={!!field.arrives}
                     value={value as string}
                     onchange={(e) =>
                       settings.setDynamic(field.section, field.key, e.currentTarget.value)}
@@ -242,6 +258,7 @@
                   <input
                     {id}
                     class="input number"
+                    disabled={!!field.arrives}
                     type="number"
                     min={field.min}
                     max={field.max}
@@ -254,6 +271,7 @@
                   <input
                     {id}
                     class="input text"
+                    disabled={!!field.arrives}
                     type="text"
                     spellcheck="false"
                     autocomplete="off"
@@ -493,6 +511,19 @@
     -webkit-user-select: text;
     word-break: break-all;
     font-family: var(--editor-font);
+  }
+  .badge {
+    margin-left: 6px;
+    padding: 1px 6px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+  .field :disabled {
+    opacity: 0.5;
   }
   .control {
     display: flex;

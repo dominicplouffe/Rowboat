@@ -1,10 +1,11 @@
 <script lang="ts">
-  import { onMount, tick } from 'svelte';
+  import { onMount } from 'svelte';
   import Sidebar from './components/Sidebar.svelte';
   import StatusBar from './components/StatusBar.svelte';
   import Workspace from './components/Workspace.svelte';
   import { ACTIONS } from './lib/actions';
   import { ipc } from './lib/ipc';
+  import { reportReady } from './lib/ready';
   import { settings } from './lib/settings.svelte';
   import { chordFromEvent, findAction } from './lib/shortcuts';
   import { tabs } from './lib/tabs.svelte';
@@ -31,9 +32,8 @@ ORDER BY o.total DESC;
     } catch (e) {
       loadError = String(e);
     }
-    // The window is usable from here; everything below is off the hot path.
-    await tick();
-    requestAnimationFrame(() => void ipc.appReady().catch(() => {}));
+    // Without settings there is no editor to wait for.
+    if (loadError) reportReady();
     ipc.appInfo().then(
       (i) => (info = i),
       () => {},

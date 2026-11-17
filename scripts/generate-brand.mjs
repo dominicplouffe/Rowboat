@@ -83,35 +83,9 @@ function ico(sizes) {
 }
 writeFileSync(join(icons, 'icon.ico'), ico([16, 24, 32, 48, 64, 256]));
 
-// ICNS: typed chunks of PNG data, @1x and @2x for 16–512 pt.
-function icns() {
-  const types = [
-    ['icp4', 16],
-    ['icp5', 32],
-    ['icp6', 64],
-    ['ic07', 128],
-    ['ic08', 256],
-    ['ic09', 512],
-    ['ic10', 1024],
-    ['ic11', 32],
-    ['ic12', 64],
-    ['ic13', 256],
-    ['ic14', 512],
-  ];
-  const chunks = types.map(([type, size]) => {
-    const data = iconAt(size);
-    const head = Buffer.alloc(8);
-    head.write(type, 0, 'ascii');
-    head.writeUInt32BE(data.length + 8, 4);
-    return Buffer.concat([head, data]);
-  });
-  const body = Buffer.concat(chunks);
-  const head = Buffer.alloc(8);
-  head.write('icns', 0, 'ascii');
-  head.writeUInt32BE(body.length + 8, 4);
-  return Buffer.concat([head, body]);
-}
-writeFileSync(join(icons, 'icon.icns'), icns());
+// icon.icns is left exactly as `tauri icon` wrote it. macOS is strict about
+// which image encodings each size slot accepts, so the small sizes there use
+// the full icon rather than a hand-assembled file with the glyph.
 
 // ---- 3. Wordmark: "Row" bold + "boat" regular, outlined from Nunito (OFL) ----
 

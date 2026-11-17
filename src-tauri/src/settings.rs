@@ -763,6 +763,74 @@ mod tests {
         assert!(store.import_from(&bad).is_err());
     }
 
+    /// The UI mirrors this shape by hand (`src/lib/types.ts`). Both sides are
+    /// pinned to one committed file: this test fails when the Rust defaults or
+    /// field names drift from it, and `settingsContract.test.ts` fails when the
+    /// TypeScript side does. Regenerate after an intended change with
+    /// `UPDATE_FIXTURES=1 cargo test default_settings_match`.
+    #[test]
+    fn default_settings_match_the_shared_fixture() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../src/lib/settings.defaults.json"
+        );
+        let mut defaults = Settings::default();
+        // The real default depends on who is logged in.
+        defaults.general.client_id = "rowboat-dev".into();
+        let expected = format!("{}\n", defaults.to_pretty_json());
+
+        if std::env::var_os("UPDATE_FIXTURES").is_some() {
+            fs::write(path, &expected).unwrap();
+        }
+        let actual = fs::read_to_string(path).unwrap().replace("\r\n", "\n");
+        assert_eq!(
+            actual, expected,
+            "settings.rs and src/lib/settings.defaults.json disagree"
+        );
+    }
+
+    /// Every value the UI can send for an enum setting must be one the core
+    /// accepts; otherwise the choice would be silently dropped on save.
+    #[test]
+    fn enum_values_offered_by_the_ui_are_accepted() {
+        let cases = [
+            ("general", "updateChecks", vec!["auto", "notify", "off"]),
+            ("general", "updateChannel", vec!["stable", "beta"]),
+            ("appearance", "theme", vec!["system", "light", "dark"]),
+            ("appearance", "density", vec!["comfortable", "compact"]),
+            ("editor", "autocomplete", vec!["typing", "on-demand"]),
+            (
+                "editor",
+                "formatterKeywordCase",
+                vec!["upper", "lower", "preserve"],
+            ),
+            (
+                "execution",
+                "confirmDestructive",
+                vec!["always", "prod-only", "never"],
+            ),
+            ("results", "timeZone", vec!["local", "utc"]),
+            ("results", "numberFormat", vec!["plain", "grouped"]),
+            ("results", "binaryDisplay", vec!["hex", "base64"]),
+            (
+                "connections",
+                "sshKnownHosts",
+                vec!["ask", "strict", "accept-new"],
+            ),
+        ];
+        for (section, key, values) in cases {
+            for value in values {
+                let json = format!(r#"{{"{section}": {{"{key}": "{value}"}}}}"#);
+                let parsed = Settings::from_json_lenient(&json).unwrap();
+                let round_trip: Value = serde_json::to_value(&parsed).unwrap();
+                assert_eq!(
+                    round_trip[section][key], value,
+                    "{section}.{key} = {value} was not kept"
+                );
+            }
+        }
+    }
+
     /// The settings file is exportable precisely because it has no secrets.
     #[test]
     fn settings_file_has_no_secret_shaped_keys() {

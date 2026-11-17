@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "general": {
+    "clientId": "rowboat-dev",
+    "restoreTabs": true,
+    "updateChecks": "auto",
+    "updateChannel": "stable",
+    "onboardingCompleted": false
+  },
+  "appearance": {
+    "theme": "system",
+    "density": "comfortable",
+    "editorFontFamily": "",
+    "editorFontSize": 13,
+    "gridFontFamily": "",
+    "gridFontSize": 12
+  },
+  "editor": {
+    "tabSize": 2,
+    "indentWithTabs": false,
+    "wordWrap": false,
+    "lineNumbers": true,
+    "autoCloseBrackets": true,
+    "autocomplete": "typing",
+    "formatterKeywordCase": "upper"
+  },
+  "execution": {
+    "defaultRowLimit": 1000,
+    "queryTimeoutSecs": 0,
+    "autoCommit": true,
+    "stopScriptOnError": true,
+    "confirmDestructive": "prod-only",
+    "resultMemoryCapMb": 256
+  },
+  "results": {
+    "nullText": "NULL",
+    "dateTimeFormat": "YYYY-MM-DD HH:mm:ss",
+    "timeZone": "local",
+    "numberFormat": "plain",
+    "binaryDisplay": "hex",
+    "maxCellChars": 500,
+    "jsonAutoDetect": true
+  },
+  "connections": {
+    "connectTimeoutSecs": 10,
+    "keepaliveSecs": 30,
+    "autoReconnect": true,
+    "sshKnownHosts": "ask"
+  },
+  "ai": {
+    "autoSuggestFixes": true,
+    "sendSampleValues": false,
+    "schemaTokenBudget": 4000,
+    "requestTimeoutSecs": 60
+  },
+  "keyboard": {
+    "overrides": {}
+  },
+  "privacy": {
+    "keepHistory": true,
+    "historyRetentionDays": 90
+  }
+}

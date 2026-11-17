@@ -79,6 +79,11 @@ How a setting flows: UI control → `settings.set()` → `ipc.settingsSet` → R
 the normalized copy comes back and the UI adopts it. `types.ts`,
 `devBackend.ts` and `settings.rs` describe the same shape: change them together
 (`settingsSchema.test.ts` fails if a setting has no field in the UI).
+`src/lib/settings.defaults.json` pins the shape for both sides: a Rust test and
+`settingsContract.test.ts` each compare against it. After an intended change,
+regenerate it with `UPDATE_FIXTURES=1 cargo test default_settings_match`. A
+setting nothing reads yet carries `arrives: 'M1'…'M4'` in the schema and is
+shown disabled; remove the marker when the feature lands.
 
 Planned modules (do not create early): `src-tauri/src/db/` (driver trait +
 `postgres.rs`, `clickhouse.rs`, `sqlite.rs`), `src/ai/` (`openai_compat`,

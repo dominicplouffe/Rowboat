@@ -46,13 +46,26 @@ fn app_info(app: AppHandle, store: State<'_, SettingsStore>) -> AppInfo {
     }
 }
 
-/// Called by the UI after its first paint.
+/// Milliseconds since the harness launched this process, if it told us when
+/// (`ROWBOAT_BENCH_T0`, Unix epoch milliseconds). Unlike a clock started in
+/// `run()`, this includes process creation and loading the webview libraries.
+fn ms_since_launch() -> Option<f64> {
+    let t0: f64 = std::env::var("ROWBOAT_BENCH_T0").ok()?.parse().ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs_f64()
+        * 1000.0;
+    Some(now - t0)
+}
+
+/// Called by the UI once the window is usable (the editor accepts input).
 #[tauri::command]
 fn app_ready(app: AppHandle, started: State<'_, StartedAt>) {
     let Some(out) = std::env::var_os(BENCH_OUT_ENV) else {
         return;
     };
-    let ms = started.0.elapsed().as_secs_f64() * 1000.0;
+    let ms = ms_since_launch().unwrap_or_else(|| started.0.elapsed().as_secs_f64() * 1000.0);
     let _ = std::fs::write(&out, format!("{{\"startupMs\":{ms:.1}}}\n"));
     // Optionally stay up so the harness can sample idle memory.
     let idle_ms: u64 = std::env::var("ROWBOAT_BENCH_IDLE_MS")

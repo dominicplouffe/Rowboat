@@ -16,6 +16,20 @@ type FieldBase = FieldRef & {
   help?: string;
   /** Extra search terms. */
   keywords?: string;
+  /**
+   * Set while nothing in the app reads this setting yet: the milestone that
+   * makes it work. Such fields are shown disabled, with the milestone named.
+   */
+  arrives?: Milestone;
+};
+
+export type Milestone = 'M1' | 'M2' | 'M3' | 'M4';
+
+export const MILESTONE_NAMES: Record<Milestone, string> = {
+  M1: 'connections',
+  M2: 'the editor and results grid',
+  M3: 'the AI copilot',
+  M4: 'the first release',
 };
 
 export type Field =
@@ -59,6 +73,7 @@ export const FIELDS: Field[] = [
   {
     section: 'general',
     key: 'restoreTabs',
+    arrives: 'M2',
     kind: 'toggle',
     label: 'Restore tabs on start',
     help: 'Reopen the tabs and unsaved text from your last session.',
@@ -67,6 +82,7 @@ export const FIELDS: Field[] = [
   {
     section: 'general',
     key: 'updateChecks',
+    arrives: 'M4',
     kind: 'select',
     label: 'Update checks',
     options: opts(['auto', 'Install automatically'], ['notify', 'Notify me'], ['off', 'Off']),
@@ -75,6 +91,7 @@ export const FIELDS: Field[] = [
   {
     section: 'general',
     key: 'updateChannel',
+    arrives: 'M4',
     kind: 'select',
     label: 'Update channel',
     options: opts(['stable', 'Stable'], ['beta', 'Beta']),
@@ -119,6 +136,7 @@ export const FIELDS: Field[] = [
   {
     section: 'appearance',
     key: 'gridFontFamily',
+    arrives: 'M2',
     kind: 'text',
     label: 'Grid font',
     placeholder: 'System monospace',
@@ -127,6 +145,7 @@ export const FIELDS: Field[] = [
   {
     section: 'appearance',
     key: 'gridFontSize',
+    arrives: 'M2',
     kind: 'number',
     label: 'Grid font size',
     min: 8,
@@ -177,6 +196,7 @@ export const FIELDS: Field[] = [
   {
     section: 'editor',
     key: 'autocomplete',
+    arrives: 'M2',
     kind: 'select',
     label: 'Autocomplete',
     options: opts(['typing', 'As you type'], ['on-demand', 'On demand (Ctrl+Space)']),
@@ -185,6 +205,7 @@ export const FIELDS: Field[] = [
   {
     section: 'editor',
     key: 'formatterKeywordCase',
+    arrives: 'M2',
     kind: 'select',
     label: 'Formatter keyword case',
     options: opts(['upper', 'UPPERCASE'], ['lower', 'lowercase'], ['preserve', 'Leave as typed']),
@@ -207,6 +228,7 @@ export const FIELDS: Field[] = [
   {
     section: 'execution',
     key: 'queryTimeoutSecs',
+    arrives: 'M1',
     kind: 'number',
     label: 'Query timeout',
     min: 0,
@@ -218,6 +240,7 @@ export const FIELDS: Field[] = [
   {
     section: 'execution',
     key: 'autoCommit',
+    arrives: 'M1',
     kind: 'toggle',
     label: 'Auto-commit by default',
     help: 'New PostgreSQL and SQLite tabs commit each statement. Turn off to commit or roll back manually.',
@@ -226,6 +249,7 @@ export const FIELDS: Field[] = [
   {
     section: 'execution',
     key: 'stopScriptOnError',
+    arrives: 'M1',
     kind: 'toggle',
     label: 'Stop script on error',
     keywords: 'run script continue',
@@ -233,6 +257,7 @@ export const FIELDS: Field[] = [
   {
     section: 'execution',
     key: 'confirmDestructive',
+    arrives: 'M1',
     kind: 'select',
     label: 'Confirm destructive statements',
     options: opts(['always', 'Always'], ['prod-only', 'Prod connections only'], ['never', 'Never']),
@@ -242,6 +267,7 @@ export const FIELDS: Field[] = [
   {
     section: 'execution',
     key: 'resultMemoryCapMb',
+    arrives: 'M2',
     kind: 'number',
     label: 'Result memory cap',
     min: 16,
@@ -256,6 +282,7 @@ export const FIELDS: Field[] = [
   {
     section: 'results',
     key: 'nullText',
+    arrives: 'M2',
     kind: 'text',
     label: 'NULL display text',
     maxLength: 32,
@@ -264,6 +291,7 @@ export const FIELDS: Field[] = [
   {
     section: 'results',
     key: 'dateTimeFormat',
+    arrives: 'M2',
     kind: 'text',
     label: 'Date/time format',
     placeholder: 'YYYY-MM-DD HH:mm:ss',
@@ -273,6 +301,7 @@ export const FIELDS: Field[] = [
   {
     section: 'results',
     key: 'timeZone',
+    arrives: 'M2',
     kind: 'select',
     label: 'Time zone',
     options: opts(['local', 'Local'], ['utc', 'UTC']),
@@ -281,6 +310,7 @@ export const FIELDS: Field[] = [
   {
     section: 'results',
     key: 'numberFormat',
+    arrives: 'M2',
     kind: 'select',
     label: 'Number format',
     options: opts(['plain', '1234567.89'], ['grouped', '1,234,567.89']),
@@ -289,6 +319,7 @@ export const FIELDS: Field[] = [
   {
     section: 'results',
     key: 'binaryDisplay',
+    arrives: 'M2',
     kind: 'select',
     label: 'Binary display',
     options: opts(['hex', 'Hex'], ['base64', 'Base64']),
@@ -297,6 +328,7 @@ export const FIELDS: Field[] = [
   {
     section: 'results',
     key: 'maxCellChars',
+    arrives: 'M2',
     kind: 'number',
     label: 'Max characters per cell',
     min: 20,
@@ -308,6 +340,7 @@ export const FIELDS: Field[] = [
   {
     section: 'results',
     key: 'jsonAutoDetect',
+    arrives: 'M2',
     kind: 'toggle',
     label: 'Detect JSON in text cells',
     help: 'Open the JSON viewer for any text cell that parses as JSON.',
@@ -318,6 +351,7 @@ export const FIELDS: Field[] = [
   {
     section: 'connections',
     key: 'connectTimeoutSecs',
+    arrives: 'M1',
     kind: 'number',
     label: 'Connect timeout',
     min: 1,
@@ -327,6 +361,7 @@ export const FIELDS: Field[] = [
   {
     section: 'connections',
     key: 'keepaliveSecs',
+    arrives: 'M1',
     kind: 'number',
     label: 'Keepalive interval',
     min: 0,
@@ -338,6 +373,7 @@ export const FIELDS: Field[] = [
   {
     section: 'connections',
     key: 'autoReconnect',
+    arrives: 'M1',
     kind: 'toggle',
     label: 'Reconnect automatically',
     help: 'Tabs keep their state.',
@@ -346,6 +382,7 @@ export const FIELDS: Field[] = [
   {
     section: 'connections',
     key: 'sshKnownHosts',
+    arrives: 'M1',
     kind: 'select',
     label: 'SSH known_hosts policy',
     options: opts(
@@ -360,6 +397,7 @@ export const FIELDS: Field[] = [
   {
     section: 'ai',
     key: 'autoSuggestFixes',
+    arrives: 'M3',
     kind: 'toggle',
     label: 'Suggest fixes automatically',
     help: 'When a query fails with a syntax or schema error, show a fix as a diff to accept or dismiss. The request includes your query text, which may contain literals.',
@@ -368,6 +406,7 @@ export const FIELDS: Field[] = [
   {
     section: 'ai',
     key: 'sendSampleValues',
+    arrives: 'M3',
     kind: 'toggle',
     label: 'Send sample values (default for new connections)',
     help: 'A few distinct values per low-cardinality column help the AI write WHERE filters. Off by default: otherwise only schema metadata is sent.',
@@ -376,6 +415,7 @@ export const FIELDS: Field[] = [
   {
     section: 'ai',
     key: 'schemaTokenBudget',
+    arrives: 'M3',
     kind: 'number',
     label: 'Schema token budget',
     min: 500,
@@ -388,6 +428,7 @@ export const FIELDS: Field[] = [
   {
     section: 'ai',
     key: 'requestTimeoutSecs',
+    arrives: 'M3',
     kind: 'number',
     label: 'Request timeout',
     min: 5,
@@ -400,6 +441,7 @@ export const FIELDS: Field[] = [
   {
     section: 'privacy',
     key: 'keepHistory',
+    arrives: 'M2',
     kind: 'toggle',
     label: 'Keep query history',
     keywords: 'history log',
@@ -407,6 +449,7 @@ export const FIELDS: Field[] = [
   {
     section: 'privacy',
     key: 'historyRetentionDays',
+    arrives: 'M2',
     kind: 'number',
     label: 'History retention',
     min: 1,
@@ -415,6 +458,19 @@ export const FIELDS: Field[] = [
     keywords: 'history retention delete',
   },
 ];
+
+/**
+ * Parses what was typed into a number field. Returns null for empty or
+ * non-numeric text, so that clearing a field can never be read as 0 (which
+ * means "no limit" or "off" for several settings).
+ */
+export function parseNumberField(text: string, min: number, max: number): number | null {
+  const trimmed = text.trim();
+  if (trimmed === '') return null;
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.min(max, Math.max(min, Math.round(parsed)));
+}
 
 /** Case-insensitive match of every search word against a field's text. */
 export function matchesQuery(field: Field, sectionTitle: string, query: string): boolean {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { defaultSettings } from './devBackend';
-import { FIELDS, matchesQuery, SECTIONS } from './settingsSchema';
+import { FIELDS, matchesQuery, parseNumberField, SECTIONS } from './settingsSchema';
 
 const defaults = defaultSettings() as unknown as Record<string, Record<string, unknown>>;
 
@@ -66,5 +66,41 @@ describe('settings schema', () => {
     expect(find('ssh')).toEqual(['sshKnownHosts']);
     expect(find('zzz-nothing')).toEqual([]);
     expect(find('  ')).toHaveLength(FIELDS.length);
+  });
+
+  it('clearing a number field is never read as 0', () => {
+    // 0 means "no limit" / "no timeout" / "off" for several settings.
+    expect(parseNumberField('', 0, 1_000_000)).toBeNull();
+    expect(parseNumberField('   ', 0, 1_000_000)).toBeNull();
+    expect(parseNumberField('abc', 0, 1_000_000)).toBeNull();
+  });
+
+  it('number fields round and clamp what was typed', () => {
+    expect(parseNumberField('0', 0, 1_000_000)).toBe(0);
+    expect(parseNumberField(' 250 ', 0, 1_000_000)).toBe(250);
+    expect(parseNumberField('12.6', 8, 32)).toBe(13);
+    expect(parseNumberField('500', 8, 32)).toBe(32);
+    expect(parseNumberField('-3', 1, 8)).toBe(1);
+  });
+
+  it('settings that nothing reads yet say which milestone brings them', () => {
+    const working = FIELDS.filter((f) => !f.arrives).map((f) => `${f.section}.${f.key}`);
+    // Everything else is stored but inert until its milestone, and is shown
+    // disabled. Move a key here only when the app really acts on it.
+    expect(working.sort()).toEqual(
+      [
+        'general.clientId',
+        'appearance.theme',
+        'appearance.density',
+        'appearance.editorFontFamily',
+        'appearance.editorFontSize',
+        'editor.tabSize',
+        'editor.indentWithTabs',
+        'editor.wordWrap',
+        'editor.lineNumbers',
+        'editor.autoCloseBrackets',
+        'execution.defaultRowLimit',
+      ].sort(),
+    );
   });
 });
