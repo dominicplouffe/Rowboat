@@ -30,7 +30,11 @@
     typedKey = key.trim().length > 0;
   });
 
-  function setKind(kind: ProviderKind) {
+  async function setKind(kind: ProviderKind) {
+    // The saved key belongs to the provider it was entered for: never carry
+    // it over to a different one.
+    key = '';
+    if (hasKey) await removeKey();
     const previous = providerInfo(provider.kind).label;
     provider.kind = kind;
     // Keep a name the user typed; replace one we filled in.

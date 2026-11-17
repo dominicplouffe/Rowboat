@@ -758,3 +758,76 @@ async fn a_stream_that_goes_silent_times_out_but_a_slow_steady_one_does_not() {
     assert_eq!(text, "part");
     assert!(started.elapsed() < Duration::from_secs(3));
 }
+
+#[tokio::test]
+async fn a_key_is_never_sent_in_clear_text_to_another_machine() {
+    let (base, seen) = serve(vec![answer("x")]).await;
+    let mut f = fixture(&base).await;
+    f.manager.set_ai_key("p1", KEY).unwrap();
+    f.settings.ai.providers[0].base_url = "http://api.example.com/v1".into();
+    let error = Copilot::default()
+        .run(&f.manager, &f.settings, ask(&f, "anything"), &|_| {})
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, AiErrorKind::NotConfigured);
+    assert!(error.message.contains("unencrypted"));
+    assert!(seen.lock().unwrap().is_empty());
+
+    // The same key to a server on this machine is fine.
+    f.settings.ai.providers[0].base_url = base;
+    Copilot::default()
+        .run(&f.manager, &f.settings, ask(&f, "anything"), &|_| {})
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn deleting_a_connection_forgets_its_schema_index() {
+    let (base, _) = serve(vec![answer("x")]).await;
+    let f = fixture(&base).await;
+    let copilot = Copilot::default();
+    copilot
+        .index_info(&f.manager, &f.connection, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let key = format!("schema-index/{}", f.connection);
+    assert!(f.manager.session_load(&key).unwrap().is_some());
+
+    f.manager.delete(&f.connection).await.unwrap();
+    copilot.forget(&f.manager, &f.connection);
+    assert_eq!(f.manager.session_load(&key).unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_model_with_a_lower_output_limit_gets_a_second_request_that_fits() {
+    let (base, seen) = serve(vec![
+        json(
+            400,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: 16000 > 4096, which is the maximum allowed"}}"#,
+        ),
+        sse(&[
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]),
+    ])
+    .await;
+    let (result, text) = stream(&endpoint(ProviderKind::Anthropic, &base)).await;
+    result.unwrap();
+    assert_eq!(text, "ok");
+    let seen = seen.lock().unwrap();
+    assert_eq!(body_of(&seen[0])["max_tokens"], 16000);
+    assert_eq!(body_of(&seen[1])["max_tokens"], 4096);
+}
+
+#[tokio::test]
+async fn any_other_bad_request_is_reported_not_retried() {
+    let (base, seen) = serve(vec![json(
+        400,
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"model: not found"}}"#,
+    )])
+    .await;
+    let (result, _) = stream(&endpoint(ProviderKind::Anthropic, &base)).await;
+    assert!(result.unwrap_err().message.contains("model: not found"));
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}

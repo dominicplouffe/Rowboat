@@ -182,6 +182,11 @@ export interface RunResult {
   /** Set when the rows can be edited in place. */
   editable: EditTarget | null;
   elapsedMs: number;
+  /**
+   * False for a statement that changes data: it must not be run again to
+   * fetch more rows, count them or export them.
+   */
+  repeatable: boolean;
 }
 
 export interface SchemaNode {
@@ -246,6 +251,8 @@ export interface RunOptions {
   confirmed?: boolean;
   /** Fetch past the result memory cap. */
   uncapped?: boolean;
+  /** This run repeats a statement to fetch more of its rows. */
+  refetch?: boolean;
 }
 
 // ---- AI copilot ----
@@ -345,4 +352,11 @@ export interface IndexInfo {
   fingerprint: string;
   changed: boolean;
   withSamples: boolean;
+}
+
+export interface UpdateInfo {
+  version: string;
+  /** The release page on GitHub. */
+  url: string;
+  prerelease: boolean;
 }

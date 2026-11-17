@@ -81,19 +81,19 @@ export const FIELDS: Field[] = [
   {
     section: 'general',
     key: 'updateChecks',
-    arrives: 'M4',
     kind: 'select',
     label: 'Update checks',
     options: opts(['auto', 'Install automatically'], ['notify', 'Notify me'], ['off', 'Off']),
-    keywords: 'auto-update upgrade',
+    help: 'Rowboat asks GitHub which releases exist and sends nothing else. For now both choices show a notice in the status bar that opens the download page: installing by itself needs signed builds, which are not set up yet. Off makes no request.',
+    keywords: 'auto-update upgrade new version',
   },
   {
     section: 'general',
     key: 'updateChannel',
-    arrives: 'M4',
     kind: 'select',
     label: 'Update channel',
     options: opts(['stable', 'Stable'], ['beta', 'Beta']),
+    help: 'Beta also offers pre-releases.',
     keywords: 'release prerelease',
   },
 

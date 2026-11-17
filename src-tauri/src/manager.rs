@@ -18,7 +18,7 @@ use crate::export::{self, Format};
 use crate::secrets::{SecretKind, Secrets};
 use crate::settings::{ConfirmDestructive, Settings};
 use crate::ssh::{default_known_hosts_path, Tunnel, TunnelParams};
-use crate::statements::destructive_reason;
+use crate::statements::{self, destructive_reason};
 
 /// Secrets as typed by the user. `None` leaves the stored secret alone, an
 /// empty string deletes it. This type only ever travels *into* the core.
@@ -64,6 +64,9 @@ pub struct RunResult {
     #[serde(flatten)]
     pub result: QueryResult,
     pub elapsed_ms: u64,
+    /// False for a statement that changes data: it is never run a second
+    /// time to fetch more rows, count them or export them.
+    pub repeatable: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -75,6 +78,8 @@ pub struct RunOptions {
     pub confirmed: bool,
     /// Fetch past the result memory cap.
     pub uncapped: bool,
+    /// This run repeats a statement to fetch more of its rows.
+    pub refetch: bool,
 }
 
 pub(crate) fn now_ms() -> i64 {
@@ -392,6 +397,7 @@ impl Manager {
             row_limit,
             confirmed,
             uncapped: false,
+            refetch: false,
         };
         self.run_with(connection_id, query_id, sql, options, settings)
             .await
@@ -411,6 +417,10 @@ impl Manager {
         settings: &Settings,
     ) -> DbResult<RunResult> {
         let open = self.session(connection_id).await?;
+        let repeatable = statements::repeatable(open.config.kind, sql);
+        if options.refetch && !repeatable {
+            return Err(not_repeatable());
+        }
 
         let guarded = match settings.execution.confirm_destructive {
             ConfirmDestructive::Always => true,
@@ -464,6 +474,7 @@ impl Manager {
         Ok(RunResult {
             result: result?,
             elapsed_ms,
+            repeatable,
         })
     }
 
@@ -476,6 +487,9 @@ impl Manager {
         settings: &Settings,
     ) -> DbResult<u64> {
         let open = self.session(connection_id).await?;
+        if !statements::repeatable(open.config.kind, sql) {
+            return Err(not_repeatable());
+        }
         // A separate statement that wraps the user's query; their own SQL is
         // not changed and this is never what Run sends.
         let body = sql.trim().trim_end_matches(';').trim_end();
@@ -521,7 +535,15 @@ impl Manager {
         table: &str,
     ) -> DbResult<u64> {
         let open = self.session(connection_id).await?;
-        let file = std::fs::File::create(path)
+        if !statements::repeatable(open.config.kind, sql) {
+            return Err(not_repeatable());
+        }
+        // Written next to the target and renamed when complete, so a failed
+        // or cancelled export never destroys a file it was going to replace.
+        let mut partial = path.as_os_str().to_owned();
+        partial.push(".partial");
+        let partial = std::path::PathBuf::from(partial);
+        let file = std::fs::File::create(&partial)
             .map_err(|e| DbError::other(format!("Could not create {}: {e}", path.display())))?;
         let writer = export::Writer::new(
             std::io::BufWriter::with_capacity(1 << 16, file),
@@ -536,9 +558,14 @@ impl Manager {
                 Box::pin(session.export(sql, Box::new(writer)))
             })
             .await;
+        let result = result.and_then(|rows| {
+            std::fs::rename(&partial, path)
+                .map(|()| rows)
+                .map_err(|e| DbError::other(format!("Could not write {}: {e}", path.display())))
+        });
         if result.is_err() {
             // Do not leave half a file behind.
-            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(&partial);
         }
         result
     }
@@ -604,7 +631,12 @@ impl Manager {
                         return Err(error);
                     }
                 }
-                session.execute(commit, all).await?;
+                if let Err(error) = session.execute(commit, all).await {
+                    // A commit that fails (a deferred constraint, say) must
+                    // not leave the session inside a half-finished transaction.
+                    let _ = session.execute(abort, all).await;
+                    return Err(error);
+                }
                 Ok(statements.len() as u64)
             })
         })
@@ -666,6 +698,10 @@ impl Manager {
 
     pub fn session_load(&self, key: &str) -> DbResult<Option<String>> {
         self.db.session_load(key).map_err(internal)
+    }
+
+    pub fn session_delete(&self, key: &str) -> DbResult<()> {
+        self.db.session_delete(key).map_err(internal)
     }
 
     fn pending(&self) -> std::sync::MutexGuard<'_, HashMap<String, Pending>> {
@@ -733,6 +769,13 @@ impl Drop for Finished<'_> {
     fn drop(&mut self) {
         self.0.pending().remove(self.1);
     }
+}
+
+fn not_repeatable() -> DbError {
+    DbError::other(
+        "This statement changes data, so Rowboat will not run it a second time to fetch, count or export its rows.",
+    )
+    .with_hint("Run a SELECT to read the rows.")
 }
 
 fn internal(error: crate::error::Error) -> DbError {
@@ -1242,6 +1285,71 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!bad.exists());
+
+        // …and never destroys the file it was going to replace.
+        m.export_query(&id, "x3", "SELECT * FROM missing", &path, Format::Csv, "t")
+            .await
+            .unwrap_err();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "no .partial left"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_statement_that_changes_data_is_never_run_again_for_more_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = manager();
+        let settings = Settings::default();
+        let id = opened(&m, &dir, "rerun", &settings).await;
+        run(&m, &id, "CREATE TABLE t (n INTEGER)", true, &settings)
+            .await
+            .unwrap();
+        run(
+            &m,
+            &id,
+            "INSERT INTO t VALUES (1), (2), (3)",
+            true,
+            &settings,
+        )
+        .await
+        .unwrap();
+
+        let bump = "UPDATE t SET n = n + 10 RETURNING n";
+        let first = run(&m, &id, bump, true, &settings).await.unwrap();
+        assert!(!first.repeatable);
+        let again = RunOptions {
+            row_limit: 0,
+            confirmed: true,
+            uncapped: false,
+            refetch: true,
+        };
+        m.run_with(&id, "p1", bump, again, &settings)
+            .await
+            .unwrap_err();
+        m.count(&id, "c1", bump, &settings).await.unwrap_err();
+        m.export_query(&id, "e1", bump, &dir.path().join("x.csv"), Format::Csv, "t")
+            .await
+            .unwrap_err();
+        let sum = run(&m, &id, "SELECT sum(n) FROM t", true, &settings)
+            .await
+            .unwrap();
+        assert_eq!(
+            sum.result.rows[0][0].as_deref(),
+            Some("36"),
+            "the UPDATE ran exactly once"
+        );
+
+        // A plain read can be repeated.
+        let read = run(&m, &id, "SELECT n FROM t", true, &settings)
+            .await
+            .unwrap();
+        assert!(read.repeatable);
+        m.run_with(&id, "p2", "SELECT n FROM t", again, &settings)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

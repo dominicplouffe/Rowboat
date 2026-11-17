@@ -214,11 +214,15 @@
       label: `Loaded rows as ${label}`,
       run: () => exportPage(format),
     })),
-    ...FORMATS.map(([format, label], i) => ({
-      label: `Full result as ${label}`,
-      separator: i === 0,
-      run: () => exportAll(format),
-    })),
+    // The full result is fetched by running the statement again, which is
+    // only offered for plain reads.
+    ...(result?.repeatable
+      ? FORMATS.map(([format, label], i) => ({
+          label: `Full result as ${label}`,
+          separator: i === 0,
+          run: () => exportAll(format),
+        }))
+      : []),
   ]);
 
   // ---- inline editing ----
@@ -430,14 +434,19 @@
           {#if shown.busy !== 'apply'}<button class="btn" onclick={() => cancel(tab)}>Cancel</button
             >{/if}
         {:else}
-          {#if result.moreAvailable}
+          {#if result.moreAvailable && !result.repeatable}
+            <span class="muted">
+              More rows exist, but this statement changes data, so it is not run again to fetch
+              them.
+            </span>
+          {:else if result.moreAvailable}
             <span class="muted">More rows available.</span>
             <button class="btn" onclick={() => fetchNextPage(tab)}>Fetch next page</button>
             <button class="btn" onclick={fetchEverything}>Fetch all</button>
           {:else}
             <span class="muted">All rows loaded.</span>
           {/if}
-          {#if shown?.count === undefined}
+          {#if shown?.count === undefined && result.repeatable}
             <button class="btn" onclick={() => countRows(tab)}>Count rows</button>
           {/if}
           {#if result.editable && !connection?.readOnly}

@@ -16,6 +16,7 @@ pub mod settings;
 pub mod ssh;
 pub mod statements;
 pub mod tls;
+pub mod updates;
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -181,6 +182,53 @@ fn open_data_folder(store: State<'_, SettingsStore>) -> Result<()> {
     Ok(())
 }
 
+// -------------------------------------------------------------- updates ----
+
+/// Asks GitHub whether a newer release exists. Sends nothing about the user.
+/// Returns `None` without any request when update checks are off, unless
+/// `manual` says the user pressed "Check now".
+#[tauri::command]
+async fn update_check(
+    app: AppHandle,
+    store: State<'_, SettingsStore>,
+    manual: bool,
+) -> std::result::Result<Option<updates::UpdateInfo>, String> {
+    let general = store.get().general;
+    if general.update_checks == settings::UpdateChecks::Off && !manual {
+        return Ok(None);
+    }
+    // Benchmarks and tests must not reach the network.
+    if std::env::var_os("ROWBOAT_BENCH_OUT").is_some() {
+        return Ok(None);
+    }
+    updates::check(
+        updates::RELEASES_API,
+        &app.package_info().version.to_string(),
+        general.update_channel,
+    )
+    .await
+}
+
+/// Opens a release page in the browser. Only Rowboat's own release pages are
+/// accepted, so the webview cannot use this to open arbitrary links.
+#[tauri::command]
+fn update_open(url: String) -> Result<()> {
+    if !url.starts_with(updates::RELEASE_PAGE_PREFIX) || url.chars().any(char::is_whitespace) {
+        return Err(Error::Other("That is not a Rowboat release page.".into()));
+    }
+    let mut command = if cfg!(target_os = "macos") {
+        std::process::Command::new("open")
+    } else if cfg!(target_os = "windows") {
+        let mut command = std::process::Command::new("rundll32");
+        command.arg("url.dll,FileProtocolHandler");
+        command
+    } else {
+        std::process::Command::new("xdg-open")
+    };
+    command.arg(&url).spawn()?;
+    Ok(())
+}
+
 // ------------------------------------------------------------------- AI ----
 //
 // An API key flows inwards once (`ai_key_set`) and is never returned. The
@@ -343,8 +391,14 @@ async fn connection_save(
 }
 
 #[tauri::command]
-async fn connection_delete(manager: State<'_, Manager>, id: String) -> DbResult<()> {
-    manager.delete(&id).await
+async fn connection_delete(
+    manager: State<'_, Manager>,
+    copilot: State<'_, Copilot>,
+    id: String,
+) -> DbResult<()> {
+    manager.delete(&id).await?;
+    copilot.forget(&manager, &id);
+    Ok(())
 }
 
 /// Tries a connection without saving it. Returns the server version.
@@ -824,6 +878,8 @@ pub fn run() {
             ai_cancel,
             ai_index,
             sample_database,
+            update_check,
+            update_open,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Rowboat");

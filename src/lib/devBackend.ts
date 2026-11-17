@@ -358,8 +358,16 @@ async function fakeDatabase<T>(command: string, args: Record<string, unknown>): 
         stoppedAtMemoryCap: false,
         editable: null,
         elapsedMs: 12,
+        repeatable:
+          /^(select|with|show|explain|values)\b/.test(lower) && !/\breturning\b/.test(lower),
       };
-      if (!/^(select|with|show|explain|values)\b/.test(lower)) {
+      if (options.refetch && !base.repeatable) {
+        throw fail(
+          'other',
+          'This statement changes data, so Rowboat will not run it a second time.',
+        );
+      }
+      if (!/^(select|with|show|explain|values)\b/.test(lower) && !/\breturning\b/.test(lower)) {
         return { ...base, rowsAffected: 1 } as T;
       }
       const limit = options.rowLimit || 5000;
@@ -392,6 +400,20 @@ async function fakeDatabase<T>(command: string, args: Record<string, unknown>): 
             },
       } as T;
     }
+    case 'update_check':
+      // The fake "newer release" exists only on the beta channel.
+      if (current.general.updateChecks === 'off' && !args.manual) return null as T;
+      return (
+        current.general.updateChannel === 'beta'
+          ? {
+              version: '0.2.0-beta.1',
+              url: 'https://github.com/dominicplouffe/Rowboat/releases/tag/v0.2.0-beta.1',
+              prerelease: true,
+            }
+          : null
+      ) as T;
+    case 'update_open':
+      return undefined as T;
     case 'ai_key_set':
       if (args.key) aiKeys.add(args.providerId as string);
       else aiKeys.delete(args.providerId as string);

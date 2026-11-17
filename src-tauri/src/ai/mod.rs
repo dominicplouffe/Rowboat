@@ -192,7 +192,11 @@ pub(crate) fn transport_error(e: reqwest::Error) -> AiError {
 pub(crate) async fn status_error(response: reqwest::Response) -> AiError {
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
-    let detail = serde_json::from_str::<serde_json::Value>(&body)
+    status_error_from(status, &body)
+}
+
+pub(crate) fn status_error_from(status: reqwest::StatusCode, body: &str) -> AiError {
+    let detail = serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| {
             let error = v.get("error")?;

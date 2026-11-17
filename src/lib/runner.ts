@@ -20,11 +20,14 @@ export interface EditorSelection {
 /** Asks the user to confirm a destructive statement. Set by the UI. */
 export const prompts: {
   confirmDestructive: (sql: string, reason: string, connectionName: string) => Promise<boolean>;
+  /** Told when a statement changed the schema; the copilot re-indexes it. */
+  schemaChanged: (connectionId: string) => void;
   /** Told about every failed statement; the copilot may suggest a fix. */
   failed: (tab: Tab, statement: StatementRun) => void;
 } = {
   // Until the UI installs its dialog, nothing destructive is confirmed.
   confirmDestructive: async () => false,
+  schemaChanged: () => {},
   failed: () => {},
 };
 
@@ -107,8 +110,10 @@ export async function run(tab: Tab, selection: EditorSelection, scope: RunScope)
           );
           statement.status = 'done';
           // Autocomplete must know about objects this statement created or changed.
-          if (changesSchema(statement.sql))
+          if (changesSchema(statement.sql)) {
             void schemaCache.refresh(connection.id, connection.kind);
+            prompts.schemaChanged(connection.id);
+          }
           connections.setInTransaction(connection.id, statement.result.inTransaction);
         } catch (e) {
           const error = asDbError(e);
@@ -184,10 +189,13 @@ async function refetch(
       connectionId: connection.id,
       queryId: tab.queryId,
       sql: statement.sql,
-      // The user confirmed this statement when it first ran.
-      options: { ...options, confirmed: true },
+      // The user confirmed this statement when it first ran. `refetch` makes
+      // the core refuse anything that is not a plain read.
+      options: { ...options, confirmed: true, refetch: true },
     });
     statement.result = unproxied(result);
+    // Staged edits are addressed by row position, which a new fetch may change.
+    statement.edits = undefined;
     statement.note = result.stoppedAtMemoryCap
       ? `Stopped at the result memory cap after ${result.rows.length.toLocaleString('en-US')} rows.`
       : undefined;
@@ -201,9 +209,23 @@ async function refetch(
 }
 
 /** Fetches one more page of the shown result. */
+/**
+ * Whether the shown result may be fetched again. A statement that changes
+ * data is never repeated, and neither is one with edits waiting: they are
+ * addressed by row position, which a new fetch could change.
+ */
+function mayRefetch(statement: StatementRun | undefined): statement is StatementRun {
+  if (!statement?.result || !statement.result.repeatable) return false;
+  if (Object.keys(statement.edits ?? {}).length > 0) {
+    statement.note = 'Apply or discard your edits before fetching more rows.';
+    return false;
+  }
+  return true;
+}
+
 export async function fetchNextPage(tab: Tab): Promise<void> {
   const statement = tab.runs[tab.shown];
-  if (!statement?.result || statement.busy || tab.running) return;
+  if (!mayRefetch(statement) || !statement.result || statement.busy || tab.running) return;
   statement.busy = 'page';
   try {
     await refetch(tab, statement, { rowLimit: statement.result.rows.length + pageSize(tab) });
@@ -215,7 +237,7 @@ export async function fetchNextPage(tab: Tab): Promise<void> {
 /** Fetches every row; `uncapped` goes past the result memory cap. */
 export async function fetchAll(tab: Tab, uncapped = false): Promise<void> {
   const statement = tab.runs[tab.shown];
-  if (!statement?.result || statement.busy || tab.running) return;
+  if (!mayRefetch(statement) || !statement.result || statement.busy || tab.running) return;
   statement.busy = 'all';
   try {
     await refetch(tab, statement, { rowLimit: 0, uncapped });
@@ -228,7 +250,7 @@ export async function fetchAll(tab: Tab, uncapped = false): Promise<void> {
 export async function countRows(tab: Tab): Promise<void> {
   const statement = tab.runs[tab.shown];
   const connection = connections.byId(tab.connectionId);
-  if (!statement?.result || !connection || statement.busy || tab.running) return;
+  if (!statement?.result?.repeatable || !connection || statement.busy || tab.running) return;
   statement.busy = 'count';
   tab.queryId = newQueryId();
   try {

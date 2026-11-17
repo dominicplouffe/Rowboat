@@ -410,6 +410,13 @@ impl AppDb {
         Ok(())
     }
 
+    pub fn session_delete(&self, key: &str) -> Result<()> {
+        self.lock()
+            .execute("DELETE FROM session WHERE key = ?1", params![key])
+            .map(|_| ())
+            .map_err(db_err)
+    }
+
     pub fn session_load(&self, key: &str) -> Result<Option<String>> {
         use rusqlite::OptionalExtension;
         self.lock()

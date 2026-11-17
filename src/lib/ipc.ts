@@ -29,6 +29,7 @@ import type {
   SecretInput,
   Settings,
   StatementSpan,
+  UpdateInfo,
 } from './types';
 
 type Invoke = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
@@ -159,6 +160,14 @@ export const ipc = {
   /** Builds (or with `refresh`, rebuilds) the schema index. Null when there is none and the connection is closed. */
   aiIndex: (connectionId: string, refresh: boolean) =>
     call<IndexInfo | null>('ai_index', { connectionId, refresh }),
+
+  /**
+   * Asks GitHub whether a newer release exists; null when there is none or
+   * when update checks are off (`manual` overrides that). Rejects with a string.
+   */
+  updateCheck: (manual: boolean) => call<UpdateInfo | null>('update_check', { manual }),
+  /** Opens a Rowboat release page in the browser. */
+  updateOpen: (url: string) => call<void>('update_open', { url }),
 
   /** Creates the sample SQLite database and a connection to it. */
   sampleDatabase: () => call<ConnectionView>('sample_database'),

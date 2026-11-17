@@ -69,16 +69,20 @@
       saveClientId();
     }
     if (step === 1 && useAi && providerReady) await saveProvider();
+    else if (step === 1) await dropUnusedKey();
     step = Math.min(step + 1, STEPS.length - 1);
+  }
+
+  /** A key typed for a provider that is not kept must not stay in the keychain. */
+  async function dropUnusedKey() {
+    if (existing) return;
+    await ipc.aiKeySet(provider.id, '').catch(() => {});
+    delete ai.keys[provider.id];
   }
 
   /** Leaves a step without keeping what was entered on it. */
   async function skip() {
-    if (step === 1 && !existing) {
-      // A key typed for a provider that is not kept must not stay behind.
-      await ipc.aiKeySet(provider.id, '').catch(() => {});
-      delete ai.keys[provider.id];
-    }
+    if (step === 1) await dropUnusedKey();
     step = Math.min(step + 1, STEPS.length - 1);
   }
 

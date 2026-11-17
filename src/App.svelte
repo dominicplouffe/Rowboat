@@ -40,6 +40,9 @@
       danger: true,
       prod: connections.list.find((c) => c.name === connectionName)?.environment === 'prod',
     });
+  prompts.schemaChanged = (id) => {
+    if (ai.provider) void ai.reindex(id, true);
+  };
   // Failed statements go to the copilot, which decides whether a fix may be suggested.
   prompts.failed = (tab, statement) => void ai.autoFix(tab, statement);
   // Index a schema as soon as its connection opens, but only once AI is set up.
@@ -82,6 +85,10 @@ SELECT 1;
     }
     // Without settings there is no editor to wait for.
     if (loadError) reportReady();
+    // Well after startup, and only if the user has not turned it off.
+    if (settings.value && settings.value.general.updateChecks !== 'off') {
+      setTimeout(() => void ui.checkForUpdate(false), 8000);
+    }
     ipc.appInfo().then(
       (i) => (info = i),
       () => {},
