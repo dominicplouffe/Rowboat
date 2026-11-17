@@ -1,6 +1,7 @@
 // Saved connections and their open/closed state, mirrored from the core.
 
 import { asDbError, ipc } from './ipc';
+import { schemaCache } from './schemaCache.svelte';
 import type { ConnectionConfig, ConnectionView, DbError, DbKind, SecretInput } from './types';
 
 export const DEFAULT_PORTS: Record<DbKind, number> = {
@@ -127,6 +128,7 @@ class Connections {
 
   async close(id: string): Promise<void> {
     await ipc.connectionClose(id);
+    schemaCache.forget(id);
     const view = this.byId(id);
     if (view) {
       view.connected = false;
@@ -153,6 +155,7 @@ class Connections {
    */
   async dropDead(id: string): Promise<void> {
     await ipc.connectionClose(id).catch(() => {});
+    schemaCache.forget(id);
     const view = this.byId(id);
     if (view) {
       view.connected = false;

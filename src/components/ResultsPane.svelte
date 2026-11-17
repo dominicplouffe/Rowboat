@@ -1,16 +1,43 @@
 <script lang="ts">
+  import { looksLikeJson } from '../lib/cells';
   import { connections } from '../lib/connections.svelte';
-  import { cancel } from '../lib/runner';
+  import { dialogs } from '../lib/dialogs.svelte';
+  import { applyToRows, buildRowEdits, editCount, stageEdit } from '../lib/editing';
+  import { asDbError, ipc } from '../lib/ipc';
+  import { cancel, countRows, fetchAll, fetchNextPage, replaceRows } from '../lib/runner';
+  import { settings } from '../lib/settings.svelte';
   import type { Tab } from '../lib/tabs.svelte';
-  import type { DbError } from '../lib/types';
+  import type { DbError, ExportFormat } from '../lib/types';
   import Grid from './Grid.svelte';
   import Icon from './Icon.svelte';
+  import Menu, { type MenuItem } from './Menu.svelte';
+  import PlanTree from './PlanTree.svelte';
   import RowLimitMenu from './RowLimitMenu.svelte';
+  import SidePanel from './SidePanel.svelte';
 
   let { tab }: { tab: Tab } = $props();
 
   const shown = $derived(tab.runs[tab.shown]);
   const result = $derived(shown?.result);
+  const connection = $derived(connections.byId(tab.connectionId));
+
+  // View state for the shown result. Reset when another result is shown.
+  let filter = $state('');
+  let hidden = $state<number[]>([]);
+  let selected = $state<{ row: number; column: number } | null>(null);
+  let recordView = $state(false);
+  let jsonClosed = $state(false);
+  let matching = $state(0);
+  $effect(() => {
+    void result?.columns;
+    filter = '';
+    hidden = [];
+    recordView = false;
+  });
+  $effect(() => {
+    void selected;
+    jsonClosed = false;
+  });
 
   const ERROR_TITLES: Record<DbError['kind'], string> = {
     syntax: 'Syntax error',
@@ -26,17 +53,21 @@
 
   const count = (n: number) => n.toLocaleString('en-US');
   const duration = (ms: number) => (ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(2)} s`);
+  const plural = (n: number, word: string) => `${count(n)} ${word}${n === 1 ? '' : 's'}`;
 
   const summary = $derived.by(() => {
     if (!result) return '';
     const parts: string[] = [];
     if (result.columns.length > 0) {
-      parts.push(`${count(result.rows.length)} ${result.rows.length === 1 ? 'row' : 'rows'}`);
-      if (result.moreAvailable) parts.push('more available');
-    } else if (result.rowsAffected !== null) {
       parts.push(
-        `${count(result.rowsAffected)} ${result.rowsAffected === 1 ? 'row' : 'rows'} affected`,
+        filter.trim()
+          ? `${count(matching)} of ${plural(result.rows.length, 'row')}`
+          : plural(result.rows.length, 'row'),
       );
+      if (shown?.count !== undefined) parts.push(`${count(shown.count)} in total`);
+      else if (result.moreAvailable) parts.push('more available');
+    } else if (result.rowsAffected !== null) {
+      parts.push(`${plural(result.rowsAffected, 'row')} affected`);
     }
     parts.push(duration(result.elapsedMs));
     return parts.join(' · ');
@@ -62,6 +93,200 @@
   });
 
   const statusIcon = { pending: '·', running: '…', done: '✓', failed: '✕', skipped: '–' } as const;
+
+  // ---- side panel ----
+
+  const selectedRow = $derived.by(() => {
+    if (!result || !selected) return null;
+    const row = result.rows[selected.row];
+    if (!row) return null;
+    const edits = shown?.edits?.[selected.row];
+    return edits ? row.map((value, i) => (i in edits ? edits[i] : value)) : row;
+  });
+  const panel = $derived.by((): 'json' | 'record' | null => {
+    if (!result || !selected || !selectedRow) return null;
+    if (recordView) return 'record';
+    const auto = settings.value?.results.jsonAutoDetect ?? true;
+    const isJson = looksLikeJson(
+      selectedRow[selected.column],
+      result.columns[selected.column],
+      auto,
+    );
+    return isJson && !jsonClosed ? 'json' : null;
+  });
+
+  // ---- columns, copy, export ----
+
+  const tableName = $derived(
+    result?.editable
+      ? [result.editable.schema, result.editable.table].filter(Boolean).join('.')
+      : 'table_name',
+  );
+
+  const columnItems = $derived<MenuItem[]>(
+    (result?.columns ?? []).map((column, i) => ({
+      label: column.name,
+      checked: !hidden.includes(i),
+      run: () => {
+        hidden = hidden.includes(i) ? hidden.filter((c) => c !== i) : [...hidden, i];
+      },
+    })),
+  );
+
+  const FORMATS: [ExportFormat, string][] = [
+    ['tsv', 'TSV'],
+    ['csv', 'CSV'],
+    ['json', 'JSON'],
+    ['ndjson', 'NDJSON'],
+    ['markdown', 'Markdown'],
+    ['sql', 'SQL INSERT'],
+  ];
+
+  /** The loaded rows and visible columns, as they would be exported. */
+  function page() {
+    const keep = result!.columns.map((_, i) => i).filter((i) => !hidden.includes(i));
+    return {
+      columns: keep.map((i) => result!.columns[i]),
+      rows: result!.rows.map((row) => keep.map((i) => row[i])),
+    };
+  }
+
+  async function copyAs(format: ExportFormat) {
+    if (!result || !connection || !shown) return;
+    try {
+      const text = await ipc.formatRows({
+        format,
+        kind: connection.kind,
+        table: tableName,
+        ...page(),
+      });
+      await navigator.clipboard.writeText(text);
+      shown.note = `Copied ${plural(result.rows.length, 'row')}.`;
+    } catch (e) {
+      shown.note = `Could not copy: ${asDbError(e).message}`;
+    }
+  }
+
+  async function exportPage(format: ExportFormat) {
+    if (!result || !connection || !shown) return;
+    try {
+      const done = await ipc.exportPage({
+        format,
+        kind: connection.kind,
+        table: tableName,
+        ...page(),
+      });
+      if (done) shown.note = `Exported ${plural(done.rows, 'row')} to ${done.path}`;
+    } catch (e) {
+      shown.note = `Export failed: ${asDbError(e).message}`;
+    }
+  }
+
+  async function exportAll(format: ExportFormat) {
+    if (!connection || !shown || shown.busy) return;
+    shown.busy = 'export';
+    tab.queryId = crypto.randomUUID();
+    try {
+      const done = await ipc.exportQuery({
+        connectionId: connection.id,
+        queryId: tab.queryId,
+        sql: shown.sql,
+        format,
+        table: tableName,
+      });
+      if (done) shown.note = `Exported ${plural(done.rows, 'row')} to ${done.path}`;
+    } catch (e) {
+      const error = asDbError(e);
+      shown.note =
+        error.kind === 'cancelled' ? 'Export cancelled.' : `Export failed: ${error.message}`;
+    } finally {
+      shown.busy = undefined;
+      tab.queryId = null;
+    }
+  }
+
+  const copyItems = $derived<MenuItem[]>(
+    FORMATS.map(([format, label]) => ({ label: `Copy as ${label}`, run: () => copyAs(format) })),
+  );
+  const exportItems = $derived<MenuItem[]>([
+    ...FORMATS.map(([format, label]) => ({
+      label: `Loaded rows as ${label}`,
+      run: () => exportPage(format),
+    })),
+    ...FORMATS.map(([format, label], i) => ({
+      label: `Full result as ${label}`,
+      separator: i === 0,
+      run: () => exportAll(format),
+    })),
+  ]);
+
+  // ---- inline editing ----
+
+  const pending = $derived(editCount(shown?.edits));
+
+  async function previewEdits() {
+    if (!result || !shown?.edits || !connection) return;
+    try {
+      const statements = await ipc.editsPreview(
+        connection.id,
+        result.editable!,
+        buildRowEdits(result, shown.edits),
+      );
+      const apply = await dialogs.confirm({
+        title: `Apply ${plural(statements.length, 'update')} to ${connection.name}?`,
+        message: 'These statements run in one transaction: either all of them are saved or none.',
+        detail: statements.map((s) => `${s};`).join('\n'),
+        confirmLabel: 'Apply',
+        prod: connection.environment === 'prod',
+      });
+      if (apply) await applyEdits();
+    } catch (e) {
+      shown.note = asDbError(e).message;
+    }
+  }
+
+  async function applyEdits() {
+    if (!result || !shown?.edits || !connection || shown.busy) return;
+    shown.busy = 'apply';
+    try {
+      const saved = await ipc.editsApply(
+        connection.id,
+        crypto.randomUUID(),
+        result.editable!,
+        buildRowEdits(result, shown.edits),
+      );
+      replaceRows(shown, applyToRows(result.rows, shown.edits));
+      shown.edits = {};
+      shown.note = `Saved ${plural(saved, 'row')}.`;
+    } catch (e) {
+      const error = asDbError(e);
+      shown.note = [error.message, error.detail].filter(Boolean).join(' — ');
+    } finally {
+      shown.busy = undefined;
+    }
+  }
+
+  async function fetchEverything() {
+    await fetchAll(tab);
+    const now = tab.runs[tab.shown];
+    if (!now?.result?.stoppedAtMemoryCap) return;
+    const cap = settings.value?.execution.resultMemoryCapMb ?? 256;
+    const more = await dialogs.confirm({
+      title: 'This result is larger than the memory cap',
+      message: `Fetching stopped at ${cap} MB (${plural(now.result.rows.length, 'row')}). Fetching the rest may use a lot of memory. To save everything without loading it, use Export → Full result instead.`,
+      confirmLabel: 'Fetch all anyway',
+      danger: true,
+    });
+    if (more) await fetchAll(tab, true);
+  }
+
+  const BUSY_TEXT = {
+    page: 'Fetching next page…',
+    all: 'Fetching all rows…',
+    count: 'Counting rows…',
+    export: 'Exporting…',
+    apply: 'Saving edits…',
+  } as const;
 </script>
 
 <div class="results">
@@ -84,8 +309,39 @@
         {/each}
       </div>
     {/if}
+    {#if result && result.columns.length > 0}
+      <label class="filter">
+        <Icon name="search" size={13} />
+        <input
+          type="search"
+          placeholder="Filter rows"
+          aria-label="Filter loaded rows"
+          spellcheck="false"
+          bind:value={filter}
+        />
+      </label>
+    {/if}
     <span class="spacer"></span>
     {#if !tab.running && summary}<span class="summary muted">{summary}</span>{/if}
+    {#if result && result.columns.length > 0}
+      <Menu label="Columns" items={columnItems} title="Show or hide columns" />
+      <Menu label="Copy" items={copyItems} title="Copy the loaded rows" />
+      <Menu
+        label="Export"
+        items={exportItems}
+        disabled={!!shown?.busy}
+        title="Save rows to a file"
+      />
+      <button
+        class="btn"
+        aria-pressed={recordView}
+        class:on={recordView}
+        title="Show the selected row as a form"
+        onclick={() => (recordView = !recordView)}
+      >
+        Record
+      </button>
+    {/if}
     <RowLimitMenu value={tab.rowLimit} onchange={(limit) => (tab.rowLimit = limit)} />
   </div>
 
@@ -115,23 +371,76 @@
         {#each result.notices as notice, i (i)}<li>{notice}</li>{/each}
       </ul>
     {/if}
-    {#if result.raw !== null}
+    {#if shown?.plan && connection && result.columns.length > 0}
+      <PlanTree kind={connection.kind} {result} />
+    {:else if result.raw !== null}
       <pre class="raw">{result.raw}</pre>
-      {#if result.moreAvailable}<p class="more muted">Output cut off at 5 MB.</p>{/if}
+      {#if result.moreAvailable}<p class="status muted">Output cut off at 5 MB.</p>{/if}
     {:else if result.columns.length > 0}
-      <Grid columns={result.columns} rows={result.rows} />
-      {#if result.moreAvailable}
-        <p class="more muted">
-          Showing the first {count(result.rows.length)} rows; the query has more. Raise the limit to fetch
-          more (paging arrives in M2).
-        </p>
+      <div class="data">
+        <Grid
+          columns={result.columns}
+          rows={result.rows}
+          {filter}
+          {hidden}
+          editable={connection?.readOnly ? null : result.editable}
+          edits={shown?.edits ?? {}}
+          bind:selected
+          onedit={(row, column, value) => shown && stageEdit(shown, row, column, value)}
+          onshown={(n) => (matching = n)}
+        />
+        {#if panel && selected && selectedRow}
+          <SidePanel
+            mode={panel}
+            columns={result.columns}
+            row={selectedRow}
+            column={selected.column}
+            onclose={() => (panel === 'record' ? (recordView = false) : (jsonClosed = true))}
+          />
+        {/if}
+      </div>
+
+      {#if pending > 0}
+        <div class="status edits">
+          <strong>{plural(pending, 'unsaved edit')}</strong>
+          <span class="spacer"></span>
+          <button class="btn" disabled={!!shown?.busy} onclick={previewEdits}>Preview SQL…</button>
+          <button class="btn primary" disabled={!!shown?.busy} onclick={applyEdits}>Apply</button>
+          <button class="btn" disabled={!!shown?.busy} onclick={() => shown && (shown.edits = {})}
+            >Discard</button
+          >
+        </div>
       {/if}
+
+      <div class="status">
+        {#if shown?.busy}
+          <span role="status">{BUSY_TEXT[shown.busy]}</span>
+          {#if shown.busy !== 'apply'}<button class="btn" onclick={() => cancel(tab)}>Cancel</button
+            >{/if}
+        {:else}
+          {#if result.moreAvailable}
+            <span class="muted">More rows available.</span>
+            <button class="btn" onclick={() => fetchNextPage(tab)}>Fetch next page</button>
+            <button class="btn" onclick={fetchEverything}>Fetch all</button>
+          {:else}
+            <span class="muted">All rows loaded.</span>
+          {/if}
+          {#if shown?.count === undefined}
+            <button class="btn" onclick={() => countRows(tab)}>Count rows</button>
+          {/if}
+          {#if result.editable && !connection?.readOnly}
+            <span class="muted hint-edit">Double-click a cell to edit.</span>
+          {/if}
+        {/if}
+        {#if shown?.note}<span class="note" role="status" title={shown.note}>{shown.note}</span
+          >{/if}
+      </div>
     {:else}
       <div class="placeholder muted">
         <Icon name="check" size={24} />
         <p>
           {result.rowsAffected !== null
-            ? `Done. ${count(result.rowsAffected)} ${result.rowsAffected === 1 ? 'row' : 'rows'} affected.`
+            ? `Done. ${plural(result.rowsAffected, 'row')} affected.`
             : 'Done.'}
         </p>
       </div>
@@ -142,7 +451,7 @@
     <div class="placeholder muted">
       <Icon name="database" size={28} />
       <p>
-        {connections.byId(tab.connectionId)
+        {connection
           ? 'Results will appear here once you run a query.'
           : 'Choose a connection to run queries.'}
       </p>
@@ -160,7 +469,7 @@
   .toolbar {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
     padding: 6px 10px;
     flex: none;
     border-bottom: 1px solid var(--border);
@@ -178,6 +487,37 @@
   .summary {
     font-size: 12px;
     font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .filter {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: var(--row);
+    width: 180px;
+    padding: 0 8px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    color: var(--text-muted);
+  }
+  .filter:focus-within {
+    outline: 2px solid var(--focus);
+    outline-offset: -1px;
+  }
+  .filter input {
+    flex: 1;
+    min-width: 0;
+    border: none;
+    outline: none;
+    background: none;
+    appearance: none;
+    -webkit-appearance: none;
+    user-select: text;
+    -webkit-user-select: text;
+  }
+  .btn.on {
+    background: var(--bg-active);
+    border-color: var(--focus);
   }
   .statements {
     display: flex;
@@ -203,6 +543,11 @@
   }
   .statements button.failed {
     color: var(--danger);
+  }
+  .data {
+    display: flex;
+    flex: 1;
+    min-height: 0;
   }
   .placeholder {
     flex: 1;
@@ -279,12 +624,34 @@
     user-select: text;
     -webkit-user-select: text;
   }
-  .more {
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     flex: none;
+    min-height: 34px;
     margin: 0;
-    padding: 5px 12px;
+    padding: 4px 10px;
     font-size: 12px;
     border-top: 1px solid var(--border);
     background: var(--bg-subtle);
+  }
+  .status .btn {
+    height: 24px;
+  }
+  .status.edits {
+    background: rgba(232, 163, 61, 0.16);
+  }
+  .note {
+    margin-left: auto;
+    max-width: 55%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    user-select: text;
+    -webkit-user-select: text;
+  }
+  .hint-edit {
+    margin-left: 4px;
   }
 </style>

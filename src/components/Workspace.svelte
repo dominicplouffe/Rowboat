@@ -92,6 +92,14 @@
             >
               Run script
             </button>
+            <button
+              class="btn"
+              disabled={!connection}
+              onclick={() => action('query.explain').run()}
+              title="Show the plan of the statement under the cursor ({chord('query.explain')})"
+            >
+              Explain
+            </button>
           {/if}
 
           {#if connections.list.length === 0}
@@ -117,6 +125,23 @@
           {#if connection?.readOnly}<span class="badge">read-only</span>{/if}
 
           <span class="spacer"></span>
+
+          {#if !tab.generated}
+            <button
+              class="btn ghost"
+              onclick={() => action('editor.format').run()}
+              title="Format SQL ({chord('editor.format')})"
+            >
+              Format
+            </button>
+          {/if}
+          <button
+            class="btn ghost"
+            onclick={() => action('history.open').run()}
+            title="Query history ({chord('history.open')})"
+          >
+            History
+          </button>
 
           {#if connection?.inTransaction}
             <span class="tx" role="status">Transaction open</span>

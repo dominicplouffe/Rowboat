@@ -6,6 +6,9 @@ import type {
   ConnectionConfig,
   ConnectionView,
   DbError,
+  HistoryEntry,
+  RunOptions,
+  SchemaSnapshot,
   RunResult,
   SchemaNode,
   SecretInput,
@@ -116,6 +119,47 @@ const withPassword = new Set<string>();
 const open = new Set<string>();
 const cancelled = new Set<string>();
 const manualCommit = new Set<string>();
+const history: HistoryEntry[] = [];
+let savedSession: string | null = null;
+
+const SNAPSHOT: SchemaSnapshot = {
+  searchPath: ['public'],
+  tables: [
+    {
+      schema: 'public',
+      name: 'customers',
+      kind: 'table',
+      columns: [
+        { name: 'id', typeName: 'integer', primaryKey: true },
+        { name: 'name', typeName: 'text', primaryKey: false },
+      ],
+      foreignKeys: [],
+    },
+    {
+      schema: 'public',
+      name: 'orders',
+      kind: 'table',
+      columns: [
+        { name: 'id', typeName: 'integer', primaryKey: true },
+        { name: 'customer_id', typeName: 'integer', primaryKey: false },
+        { name: 'total', typeName: 'numeric(10,2)', primaryKey: false },
+        { name: 'created_at', typeName: 'timestamp with time zone', primaryKey: false },
+      ],
+      foreignKeys: [
+        {
+          columns: ['customer_id'],
+          refSchema: 'public',
+          refTable: 'customers',
+          refColumns: ['id'],
+        },
+      ],
+    },
+  ],
+  functions: [
+    { name: 'count', signature: '(*)' },
+    { name: 'lower', signature: '(text)' },
+  ],
+};
 let nextId = 1;
 
 function fail(kind: DbError['kind'], message: string, extra: Partial<DbError> = {}): DbError {
@@ -217,6 +261,41 @@ async function fakeDatabase<T>(command: string, args: Record<string, unknown>): 
     case 'transaction_end':
     case 'pick_file':
       return (command === 'pick_file' ? null : undefined) as T;
+    case 'schema_snapshot':
+      return SNAPSHOT as T;
+    case 'query_count':
+      return 5000 as T;
+    case 'export_query':
+    case 'export_page':
+    case 'sql_file_open':
+    case 'sql_file_save':
+      return null as T;
+    case 'format_rows':
+      return (args.rows as (string | null)[][]).map((row) => row.join('\t')).join('\n') as T;
+    case 'edits_preview':
+      return (args.edits as { key: string[]; changes: [string, string | null][] }[]).map(
+        (edit) =>
+          `UPDATE orders SET ${edit.changes
+            .map(([c, v]) => `${c} = ${v === null ? 'NULL' : `'${v}'`}`)
+            .join(', ')} WHERE id = '${edit.key[0]}'`,
+      ) as T;
+    case 'edits_apply':
+      return (args.edits as unknown[]).length as T;
+    case 'history_search': {
+      const words = (args.search as string).toLowerCase().split(/\s+/).filter(Boolean);
+      return history
+        .filter((h) => !args.connectionId || h.connectionId === args.connectionId)
+        .filter((h) => words.every((w) => h.sql.toLowerCase().includes(w)))
+        .slice(0, args.limit as number) as T;
+    }
+    case 'history_clear':
+      history.length = 0;
+      return undefined as T;
+    case 'session_save':
+      savedSession = args.value as string;
+      return undefined as T;
+    case 'session_load':
+      return savedSession as T;
     case 'schema_children':
       return (TREE[(args.path as string[]).join('/')] ?? []) as T;
     case 'schema_ddl':
@@ -226,10 +305,20 @@ async function fakeDatabase<T>(command: string, args: Record<string, unknown>): 
       const config = connections.get(args.connectionId as string);
       if (!config || !open.has(config.id)) throw fail('connection', 'This connection is not open.');
       const lower = sql.toLowerCase();
+      const options = args.options as RunOptions;
+      history.unshift({
+        id: history.length + 1,
+        connectionId: config.id,
+        sql,
+        startedAt: Date.now(),
+        elapsedMs: 12,
+        rows: null,
+        error: null,
+      });
       if (
         config.environment === 'prod' &&
         /^(drop|truncate|alter)\b/.test(lower) &&
-        !args.confirmed
+        !options.confirmed
       ) {
         throw fail('needs-confirmation', 'DROP removes objects permanently.');
       }
@@ -260,12 +349,14 @@ async function fakeDatabase<T>(command: string, args: Record<string, unknown>): 
         raw: null,
         notices: [],
         inTransaction: false,
+        stoppedAtMemoryCap: false,
+        editable: null,
         elapsedMs: 12,
       };
       if (!/^(select|with|show|explain|values)\b/.test(lower)) {
         return { ...base, rowsAffected: 1 } as T;
       }
-      const limit = (args.rowLimit as number) || 5000;
+      const limit = options.rowLimit || 5000;
       const total = 5000;
       const count = Math.min(limit, total);
       return {
@@ -285,6 +376,14 @@ async function fakeDatabase<T>(command: string, args: Record<string, unknown>): 
           `2026-11-${String((i % 28) + 1).padStart(2, '0')} 10:00:00+00`,
         ]),
         moreAvailable: count < total,
+        editable: lower.includes('join')
+          ? null
+          : {
+              schema: 'public',
+              table: 'orders',
+              columns: ['id', 'name', 'total', 'note', 'created_at'],
+              key: ['id'],
+            },
       } as T;
     }
     default:

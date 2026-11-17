@@ -7,6 +7,7 @@
   import { connections } from './lib/connections.svelte';
   import { dialogs } from './lib/dialogs.svelte';
   import { prompts } from './lib/runner';
+  import { loadSaved, restore, saveSoon } from './lib/session';
   import { ipc } from './lib/ipc';
   import { reportReady } from './lib/ready';
   import { settings } from './lib/settings.svelte';
@@ -17,6 +18,16 @@
 
   let info = $state<AppInfo | null>(null);
   let loadError = $state<string | null>(null);
+  let sessionReady = $state(false);
+
+  // Save open tabs and their text shortly after every change.
+  $effect(() => {
+    if (!sessionReady) return;
+    for (const tab of tabs.list)
+      void [tab.title, tab.text, tab.connectionId, tab.rowLimit, tab.path];
+    void tabs.activeId;
+    saveSoon();
+  });
 
   // Prompts raised by the core's safety checks are answered here.
   prompts.confirmDestructive = (sql, reason, connectionName) =>
@@ -44,15 +55,21 @@ SELECT 1;
 
   onMount(async () => {
     try {
-      await Promise.all([settings.load(), connections.load()]);
-      tabs.open(
-        settings.value!.execution.defaultRowLimit,
-        connections.list.length === 0 ? WELCOME : '',
-        {
-          // With a single connection there is nothing to choose.
-          connectionId: connections.list.length === 1 ? connections.list[0].id : null,
-        },
-      );
+      // One round of requests, not three in a row: this is on the startup path.
+      const [, , saved] = await Promise.all([settings.load(), connections.load(), loadSaved()]);
+      const known = new Set(connections.list.map((c) => c.id));
+      const restored = settings.value!.general.restoreTabs && restore(known, saved);
+      if (!restored) {
+        tabs.open(
+          settings.value!.execution.defaultRowLimit,
+          connections.list.length === 0 ? WELCOME : '',
+          {
+            // With a single connection there is nothing to choose.
+            connectionId: connections.list.length === 1 ? connections.list[0].id : null,
+          },
+        );
+      }
+      sessionReady = true;
     } catch (e) {
       loadError = String(e);
     }
@@ -65,7 +82,7 @@ SELECT 1;
   });
 
   function onKeydown(event: KeyboardEvent) {
-    if (ui.settingsOpen || dialogs.anyOpen) return; // Dialogs handle their own keys.
+    if (ui.settingsOpen || ui.historyOpen || dialogs.anyOpen) return; // Dialogs handle their own keys.
     const chord = chordFromEvent(event);
     if (!chord) return;
     const action = findAction(ACTIONS, settings.value?.keyboard.overrides ?? {}, chord);
@@ -107,6 +124,11 @@ SELECT 1;
   {#if dialogs.confirmRequest}
     {#await import('./components/ConfirmDialog.svelte') then { default: ConfirmDialog }}
       {#key dialogs.confirmRequest}<ConfirmDialog />{/key}
+    {/await}
+  {/if}
+  {#if ui.historyOpen}
+    {#await import('./components/HistoryDialog.svelte') then { default: HistoryDialog }}
+      <HistoryDialog />
     {/await}
   {/if}
   {#if ui.settingsOpen}

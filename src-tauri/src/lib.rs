@@ -347,6 +347,35 @@ async fn export_page(
     }))
 }
 
+/// Formats rows the UI holds as text, for "Copy as". Same writers as export.
+#[tauri::command]
+fn format_rows(
+    format: export::Format,
+    kind: DbKind,
+    table: String,
+    columns: Vec<db::Column>,
+    rows: Vec<Vec<Option<String>>>,
+) -> DbResult<String> {
+    use db::RowSink;
+    let mut writer = export::Writer::new(
+        Vec::new(),
+        export::Options {
+            format,
+            kind,
+            table,
+        },
+    );
+    let write = |writer: &mut export::Writer<Vec<u8>>| -> std::io::Result<()> {
+        writer.start(&columns)?;
+        for row in &rows {
+            writer.row(row)?;
+        }
+        writer.finish()
+    };
+    write(&mut writer).map_err(|e| db::DbError::other(e.to_string()))?;
+    Ok(String::from_utf8_lossy(&writer.into_inner()).into_owned())
+}
+
 /// The UPDATE statements Apply would run, for "Preview SQL".
 #[tauri::command]
 async fn edits_preview(
@@ -625,6 +654,7 @@ pub fn run() {
             schema_snapshot,
             export_query,
             export_page,
+            format_rows,
             edits_preview,
             edits_apply,
             history_search,

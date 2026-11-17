@@ -2,9 +2,17 @@
 // lazily, after the window is usable, so it never counts against cold start
 // or the initial bundle.
 
-import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
+import {
+  autocompletion,
+  closeBrackets,
+  closeBracketsKeymap,
+  completionKeymap,
+  type Completion as CmCompletion,
+  type CompletionContext,
+  type CompletionResult as CmResult,
+} from '@codemirror/autocomplete';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
-import { PostgreSQL, SQLite, StandardSQL, sql, type SQLDialect } from '@codemirror/lang-sql';
+import { PostgreSQL, SQLDialect, SQLite, sql } from '@codemirror/lang-sql';
 import {
   bracketMatching,
   foldGutter,
@@ -39,11 +47,34 @@ import { tags as t } from '@lezer/highlight';
 
 export type Dialect = 'postgres' | 'clickhouse' | 'sqlite' | null;
 
+// ClickHouse: its own keywords, types and syntax (FORMAT, SETTINGS, ARRAY JOIN…).
+// Function names come from the server (system.functions) through autocomplete.
+const ClickHouse = SQLDialect.define({
+  keywords:
+    'select from where group by order having limit offset join left right inner full cross outer on using as ' +
+    'and or not in is null like ilike between exists case when then else end distinct union all insert into ' +
+    'values update set delete create alter drop table view database dictionary materialized with explain ' +
+    'format settings array prewhere final sample global any all asof semi anti totals rollup cube ' +
+    'partition primary key engine ttl optimize attach detach rename truncate system show describe desc asc ' +
+    'nulls first last interval populate to if temporary replace exchange kill query mutation cluster ' +
+    'codec default alias comment column index projection grant revoke use over window rows range ' +
+    'unbounded preceding following current row except intersect true false',
+  types:
+    'Int8 Int16 Int32 Int64 Int128 Int256 UInt8 UInt16 UInt32 UInt64 UInt128 UInt256 Float32 Float64 ' +
+    'Decimal Decimal32 Decimal64 Decimal128 Decimal256 Bool String FixedString UUID Date Date32 DateTime ' +
+    'DateTime64 Enum Enum8 Enum16 Array Tuple Map Nested Nullable LowCardinality IPv4 IPv6 JSON Variant ' +
+    'Dynamic AggregateFunction SimpleAggregateFunction Nothing Point Ring Polygon MultiPolygon',
+  backslashEscapes: true,
+  identifierQuotes: '`"',
+  operatorChars: '*+-%<>!=&|~^/?:',
+  hashComments: true,
+  slashComments: true,
+});
+
 const DIALECTS: Record<string, SQLDialect> = {
   postgres: PostgreSQL,
   sqlite: SQLite,
-  // A ClickHouse dialect arrives with autocomplete (M2).
-  clickhouse: StandardSQL,
+  clickhouse: ClickHouse,
 };
 
 // The database's error position, shown as a squiggle.
@@ -74,7 +105,33 @@ export interface EditorOptions {
   autoCloseBrackets: boolean;
   readOnly?: boolean;
   dialect?: Dialect;
+  /** Offer completions while typing; otherwise only on Ctrl+Space. */
+  completeOnTyping?: boolean;
 }
+
+/** What the editor needs from the schema-aware completion engine. */
+export interface CompletionProvider {
+  complete(
+    text: string,
+    cursor: number,
+  ): {
+    from: number;
+    options: { label: string; kind: string; detail: string; apply?: string; usageKey: string }[];
+  } | null;
+  accepted(usageKey: string): void;
+}
+
+// CodeMirror's icon classes for our completion kinds.
+const COMPLETION_TYPES: Record<string, string> = {
+  table: 'class',
+  view: 'interface',
+  column: 'property',
+  function: 'function',
+  keyword: 'keyword',
+  schema: 'namespace',
+  join: 'method',
+  alias: 'variable',
+};
 
 // Colors come from CSS variables, so light/dark switches need no re-theme.
 const theme = EditorView.theme({
@@ -121,6 +178,24 @@ const theme = EditorView.theme({
     border: '1px solid var(--border-strong)',
     borderRadius: '4px',
   },
+  '.cm-tooltip': {
+    backgroundColor: 'var(--bg)',
+    color: 'var(--text)',
+    border: '1px solid var(--border-strong)',
+    borderRadius: '6px',
+    boxShadow: 'var(--shadow)',
+  },
+  '.cm-tooltip.cm-tooltip-autocomplete > ul': {
+    fontFamily: 'var(--editor-font)',
+    fontSize: 'var(--editor-font-size)',
+    maxHeight: '260px',
+  },
+  '.cm-tooltip-autocomplete ul li[aria-selected]': {
+    backgroundColor: 'var(--bg-active)',
+    color: 'var(--text)',
+  },
+  '.cm-completionDetail': { color: 'var(--text-faint)', fontStyle: 'normal', marginLeft: '1em' },
+  '.cm-completionIcon': { opacity: '0.7' },
   '.cm-sql-error': {
     textDecoration: 'underline wavy var(--danger)',
     textDecorationSkipInk: 'none',
@@ -155,13 +230,17 @@ export class SqlEditor {
   #brackets = new Compartment();
   #language = new Compartment();
   #readOnly = new Compartment();
+  #completion = new Compartment();
+  #provider: CompletionProvider | null;
   #onChange: (tabId: number, text: string) => void;
 
   constructor(
     parent: HTMLElement,
     options: EditorOptions,
     onChange: (tabId: number, text: string) => void,
+    provider: CompletionProvider | null = null,
   ) {
+    this.#provider = provider;
     this.#options = options;
     this.#onChange = onChange;
     this.view = new EditorView({ parent, state: this.#newState('') });
@@ -218,6 +297,15 @@ export class SqlEditor {
     });
   }
 
+  text(): string {
+    return this.view.state.doc.toString();
+  }
+
+  /** Replaces a range (or everything) as one undoable edit. */
+  replace(insert: string, from = 0, to = this.view.state.doc.length): void {
+    this.view.dispatch({ changes: { from, to, insert }, userEvent: 'input' });
+  }
+
   /** Replaces the whole document (used for generated text). */
   setText(text: string): void {
     this.view.dispatch({ changes: { from: 0, to: this.view.state.doc.length, insert: text } });
@@ -240,6 +328,7 @@ export class SqlEditor {
         this.#brackets.reconfigure(this.#bracketsExt()),
         this.#language.reconfigure(this.#languageExt()),
         this.#readOnly.reconfigure(this.#readOnlyExt()),
+        this.#completion.reconfigure(this.#completionExt()),
       ],
     });
   }
@@ -263,6 +352,49 @@ export class SqlEditor {
     return sql({
       dialect: DIALECTS[this.#options.dialect ?? 'postgres'] ?? PostgreSQL,
       upperCaseKeywords: true,
+    });
+  }
+  #completionExt(): Extension {
+    const provider = this.#provider;
+    if (!provider) return [];
+    const source = (context: CompletionContext): CmResult | null => {
+      // While typing, wait for a word character or a dot; Ctrl+Space always asks.
+      // Also right after FROM / JOIN, where tables and join clauses belong.
+      if (
+        !context.explicit &&
+        !context.matchBefore(/[\w$"`.]$/) &&
+        !context.matchBefore(/\b(from|join|into|update)\s$/i)
+      ) {
+        return null;
+      }
+      const result = provider.complete(context.state.doc.toString(), context.pos);
+      if (!result) return null;
+      return {
+        from: result.from,
+        // Already filtered and ranked by scope and use; keep that order.
+        filter: false,
+        options: result.options.map((option, index): CmCompletion => ({
+          label: option.label,
+          detail: option.detail,
+          type: COMPLETION_TYPES[option.kind],
+          boost: -index,
+          apply: (view, _completion, from, to) => {
+            const insert = option.apply ?? option.label;
+            view.dispatch({
+              changes: { from, to, insert },
+              selection: { anchor: from + insert.length },
+              userEvent: 'input.complete',
+            });
+            provider.accepted(option.usageKey);
+          },
+        })),
+      };
+    };
+    return autocompletion({
+      override: [source],
+      activateOnTyping: this.#options.completeOnTyping ?? true,
+      maxRenderedOptions: 60,
+      icons: true,
     });
   }
   #readOnlyExt(): Extension {
@@ -293,10 +425,12 @@ export class SqlEditor {
         this.#language.of(this.#languageExt()),
         this.#readOnly.of(this.#readOnlyExt()),
         errorField,
+        this.#completion.of(this.#completionExt()),
         syntaxHighlighting(highlight),
         theme,
         placeholder('Write SQL here…'),
         keymap.of([
+          ...completionKeymap,
           ...closeBracketsKeymap,
           // Mod-Enter belongs to "Run"; CodeMirror would insert a blank line.
           ...defaultKeymap.filter((binding) => binding.key !== 'Mod-Enter'),

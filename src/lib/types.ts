@@ -171,6 +171,10 @@ export interface RunResult {
   raw: string | null;
   notices: string[];
   inTransaction: boolean;
+  /** True when fetching stopped at the result memory cap. */
+  stoppedAtMemoryCap: boolean;
+  /** Set when the rows can be edited in place. */
+  editable: EditTarget | null;
   elapsedMs: number;
 }
 
@@ -187,3 +191,53 @@ export interface StatementSpan {
 }
 
 export type FilePurpose = 'sqlite-open' | 'sqlite-new' | 'certificate' | 'key';
+
+// ---- M2: schema snapshot, editing, history (mirrors src-tauri/src/db/mod.rs) ----
+
+export interface SnapshotTable {
+  /** Schema (PostgreSQL) or database (ClickHouse); empty for SQLite. */
+  schema: string;
+  name: string;
+  kind: 'table' | 'view';
+  columns: { name: string; typeName: string; primaryKey: boolean }[];
+  foreignKeys: { columns: string[]; refSchema: string; refTable: string; refColumns: string[] }[];
+}
+
+export interface SchemaSnapshot {
+  searchPath: string[];
+  tables: SnapshotTable[];
+  functions: { name: string; signature: string }[];
+}
+
+/** Where the rows of an editable result live. */
+export interface EditTarget {
+  schema: string;
+  table: string;
+  /** The table column behind each result column; null for expressions. */
+  columns: (string | null)[];
+  key: string[];
+}
+
+export interface RowEdit {
+  key: (string | null)[];
+  changes: [string, string | null][];
+}
+
+export interface HistoryEntry {
+  id: number;
+  connectionId: string;
+  sql: string;
+  startedAt: number;
+  elapsedMs: number;
+  rows: number | null;
+  error: string | null;
+}
+
+export type ExportFormat = 'csv' | 'tsv' | 'json' | 'ndjson' | 'sql' | 'markdown';
+
+export interface RunOptions {
+  rowLimit: number;
+  confirmed?: boolean;
+  /** Fetch past the result memory cap. */
+  uncapped?: boolean;
+}

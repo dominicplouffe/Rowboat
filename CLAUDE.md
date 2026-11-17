@@ -19,7 +19,10 @@ Built milestone by milestone (spec → "Milestones"), one branch and one PR each
       schema navigator, Prod guard
   - ClickHouse has only been tested against a fake server and hand-encoded bytes;
     `tests/clickhouse.rs` has never run against a real one.
-- [ ] M2 Editor — autocomplete, virtual grid, row limits at fetch, JSON viewer, history, export
+- [x] **M2 Editor** — schema-aware autocomplete, paging, grid sort/filter/resize/hide, inline
+      editing, JSON viewer, record view, export, history, session restore, formatter, EXPLAIN
+  - Cold start measures 0.93–0.99 s on the GPU-less build VM: inside the 1 s budget with no
+    headroom. Anything added to the startup path must be lazy.
 - [ ] M3 AI copilot — providers, schema index, fix on error, onboarding wizard
 - [ ] M4 Release — full perf budgets in CI, installers, docs, tag v0.1
 
@@ -67,9 +70,17 @@ src/                     Svelte 5 UI (runes mode). Renders only.
   lib/runner.ts          Which statements run, in what order; confirmation and error handling.
   lib/schema.svelte.ts   The navigator's lazily loaded tree; SQL name/template helpers.
   lib/dialogs.svelte.ts  Confirm prompts and the connection dialog.
+  lib/complete.ts        Completion engine: context, aliases/CTEs, FK joins, fuzzy ranking. Pure.
+  lib/schemaCache.svelte.ts  In-memory schema index per connection (what completion reads).
+  lib/cells.ts           Value display (time zone, number format, binary), sorting, filtering.
+  lib/editing.ts         Staged inline edits → row edits for the core.
+  lib/session.ts         Saves and restores open tabs and unsaved text.
+  lib/format.ts          SQL formatter (sql-formatter, loaded on first use).
   editor/sqlEditor.ts    CodeMirror 6. Lazy chunk, loaded after first paint.
   components/            Sidebar, SchemaNodes, TabBar, Workspace, Editor, ResultsPane, Grid,
-                         RowLimitMenu, StatusBar, SettingsDialog, ConnectionDialog, ConfirmDialog.
+                         SidePanel (JSON viewer + record view), JsonNode, PlanTree, Menu,
+                         RowLimitMenu, StatusBar, SettingsDialog, ConnectionDialog,
+                         ConfirmDialog, HistoryDialog.
 src-tauri/
   src/lib.rs             Tauri setup and IPC commands.
   src/manager.rs         Connections + secrets + tunnels + open sessions; what the commands call.
@@ -80,7 +91,10 @@ src-tauri/
   src/db/ch_rowbinary.rs Incremental RowBinaryWithNamesAndTypes decoder.
   src/db/sqlite.rs       rusqlite on its own thread.
   src/statements.rs      Statement splitter, transaction-control and Prod-guard detection (sqlparser tokens).
-  src/connections.rs     Connection config + the app's own SQLite file (rowboat.db).
+  src/connections.rs     Connection config + the app's own SQLite file (rowboat.db):
+                         connections, query history, saved session.
+  src/export.rs          CSV / TSV / JSON / NDJSON / SQL INSERT / Markdown writers (RowSink).
+  src/edits.rs           Staged edits → UPDATE statements (what Preview SQL shows).
   src/secrets.rs         OS keychain (keyring); in-memory for the session when there is none.
   src/ssh.rs             SSH tunnels (russh) and known_hosts checking.
   src/tls.rs             rustls setup for the sslmode levels.
@@ -117,6 +131,20 @@ per-connection turn), so a queued statement can be cancelled without touching
 the running one. Auto-commit is per open connection and starts from the
 Settings default. The PostgreSQL navigator uses its own second connection, so
 catalog queries never run inside (or wait behind) the user's transaction.
+
+Results after the first page: "Fetch next page" and "Fetch all" run the
+statement again with a larger fetch window (no cursor or transaction is held
+open between pages); "Fetch all" stops at the result memory cap unless the user
+lifts it. "Count rows" wraps the query in `SELECT count(*) FROM (…)` as a
+separate statement. Export of a full result streams rows from the driver
+straight to the file (`Session::export` + `RowSink`). Result rows are kept out
+of Svelte's deep reactivity (`unproxied` in runner.ts): replace the result
+object to update the grid, do not mutate rows.
+
+Inline editing: a result is editable when every source column comes from one
+table and its whole primary key is present (`QueryResult::editable`). Edits
+are staged in the UI, turned into one UPDATE per row by `edits.rs`, and applied
+in a single transaction (a savepoint when the user already has one open).
 
 Driver rules: values leave the driver already rendered as text; the row limit
 is enforced while fetching (portal with a row count / `max_result_rows` and a

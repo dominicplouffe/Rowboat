@@ -6,13 +6,20 @@
 
 import type {
   AppInfo,
+  Column,
   ConnectionConfig,
   ConnectionView,
   DbError,
   DbKind,
+  EditTarget,
+  ExportFormat,
   FilePurpose,
+  HistoryEntry,
+  RowEdit,
+  RunOptions,
   RunResult,
   SchemaNode,
+  SchemaSnapshot,
   SecretInput,
   Settings,
   StatementSpan,
@@ -63,13 +70,55 @@ export const ipc = {
     call<ConnectionView>('connection_open', { id, trustedFingerprint }),
   connectionClose: (id: string) => call<void>('connection_close', { id }),
 
-  queryRun: (args: {
+  queryRun: (args: { connectionId: string; queryId: string; sql: string; options: RunOptions }) =>
+    call<RunResult>('query_run', args),
+  /** Counts the rows a query returns without fetching them. */
+  queryCount: (connectionId: string, queryId: string, sql: string) =>
+    call<number>('query_count', { connectionId, queryId, sql }),
+  schemaSnapshot: (connectionId: string) =>
+    call<SchemaSnapshot>('schema_snapshot', { connectionId }),
+
+  /** Re-runs `sql` with no row limit, streaming to a file the user picks. Null when cancelled. */
+  exportQuery: (args: {
     connectionId: string;
     queryId: string;
     sql: string;
-    rowLimit: number;
-    confirmed: boolean;
-  }) => call<RunResult>('query_run', args),
+    format: ExportFormat;
+    table: string;
+  }) => call<{ path: string; rows: number } | null>('export_query', args),
+  /** Writes rows the UI already holds to a file the user picks. */
+  exportPage: (args: {
+    format: ExportFormat;
+    kind: DbKind;
+    table: string;
+    columns: Column[];
+    rows: (string | null)[][];
+  }) => call<{ path: string; rows: number } | null>('export_page', args),
+  /** Formats rows as text, for the clipboard. */
+  formatRows: (args: {
+    format: ExportFormat;
+    kind: DbKind;
+    table: string;
+    columns: Column[];
+    rows: (string | null)[][];
+  }) => call<string>('format_rows', args),
+
+  editsPreview: (connectionId: string, target: EditTarget, edits: RowEdit[]) =>
+    call<string[]>('edits_preview', { connectionId, target, edits }),
+  editsApply: (connectionId: string, queryId: string, target: EditTarget, edits: RowEdit[]) =>
+    call<number>('edits_apply', { connectionId, queryId, target, edits }),
+
+  historySearch: (connectionId: string | null, search: string, limit = 200) =>
+    call<HistoryEntry[]>('history_search', { connectionId, search, limit }),
+  historyClear: () => call<void>('history_clear'),
+
+  sessionSave: (value: string) => call<void>('session_save', { value }),
+  sessionLoad: () => call<string | null>('session_load'),
+
+  sqlFileOpen: () => call<{ path: string; text: string } | null>('sql_file_open'),
+  /** Saves to `path`, or asks where when it is null. Resolves to the path, or null when cancelled. */
+  sqlFileSave: (path: string | null, text: string, name: string) =>
+    call<string | null>('sql_file_save', { path, text, name }),
   queryCancel: (queryId: string) => call<void>('query_cancel', { queryId }),
   connectionSetAutoCommit: (connectionId: string, autoCommit: boolean) =>
     call<void>('connection_set_auto_commit', { connectionId, autoCommit }),

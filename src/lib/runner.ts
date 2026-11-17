@@ -4,9 +4,10 @@
 
 import { connections } from './connections.svelte';
 import { asDbError, ipc } from './ipc';
+import { schemaCache, changesSchema } from './schemaCache.svelte';
 import { settings } from './settings.svelte';
 import type { StatementRun, Tab } from './tabs.svelte';
-import type { RunResult, StatementSpan } from './types';
+import type { DbKind, RunResult, StatementSpan } from './types';
 
 export type RunScope = 'statement' | 'script';
 
@@ -98,11 +99,13 @@ export async function run(tab: Tab, selection: EditorSelection, scope: RunScope)
               connectionId: connection.id,
               queryId: tab.queryId,
               sql: statement.sql,
-              rowLimit: tab.rowLimit,
-              confirmed,
+              options: { rowLimit: tab.rowLimit, confirmed },
             }),
           );
           statement.status = 'done';
+          // Autocomplete must know about objects this statement created or changed.
+          if (changesSchema(statement.sql))
+            void schemaCache.refresh(connection.id, connection.kind);
           connections.setInTransaction(connection.id, statement.result.inTransaction);
         } catch (e) {
           const error = asDbError(e);
@@ -152,4 +155,144 @@ export function errorOffset(statement: StatementRun): number | null {
   if (!position || position < 1) return null;
   const chars = [...statement.sql].slice(0, position - 1);
   return statement.offset + chars.join('').length;
+}
+
+// ---- Follow-ups on a result: more rows, all rows, a count ----
+
+/** Rows added by "Fetch next page": the tab's limit, or 1,000 when it has none. */
+function pageSize(tab: Tab): number {
+  return tab.rowLimit || 1000;
+}
+
+async function refetch(
+  tab: Tab,
+  statement: StatementRun,
+  options: { rowLimit: number; uncapped?: boolean },
+): Promise<void> {
+  const connection = connections.byId(tab.connectionId);
+  if (!connection || !statement.result) return;
+  tab.queryId = newQueryId();
+  try {
+    // The statement runs again with a larger fetch window; rows already on
+    // screen are fetched again, which keeps no cursor or transaction open on
+    // the server between pages.
+    const result = await ipc.queryRun({
+      connectionId: connection.id,
+      queryId: tab.queryId,
+      sql: statement.sql,
+      // The user confirmed this statement when it first ran.
+      options: { ...options, confirmed: true },
+    });
+    statement.result = unproxied(result);
+    statement.note = result.stoppedAtMemoryCap
+      ? `Stopped at the result memory cap after ${result.rows.length.toLocaleString('en-US')} rows.`
+      : undefined;
+  } catch (e) {
+    const error = asDbError(e);
+    statement.note = error.kind === 'cancelled' ? 'Cancelled.' : error.message;
+    if (error.kind === 'connection') await connections.dropDead(connection.id);
+  } finally {
+    tab.queryId = null;
+  }
+}
+
+/** Fetches one more page of the shown result. */
+export async function fetchNextPage(tab: Tab): Promise<void> {
+  const statement = tab.runs[tab.shown];
+  if (!statement?.result || statement.busy || tab.running) return;
+  statement.busy = 'page';
+  try {
+    await refetch(tab, statement, { rowLimit: statement.result.rows.length + pageSize(tab) });
+  } finally {
+    statement.busy = undefined;
+  }
+}
+
+/** Fetches every row; `uncapped` goes past the result memory cap. */
+export async function fetchAll(tab: Tab, uncapped = false): Promise<void> {
+  const statement = tab.runs[tab.shown];
+  if (!statement?.result || statement.busy || tab.running) return;
+  statement.busy = 'all';
+  try {
+    await refetch(tab, statement, { rowLimit: 0, uncapped });
+  } finally {
+    statement.busy = undefined;
+  }
+}
+
+/** Asks the database how many rows the shown query returns. */
+export async function countRows(tab: Tab): Promise<void> {
+  const statement = tab.runs[tab.shown];
+  const connection = connections.byId(tab.connectionId);
+  if (!statement?.result || !connection || statement.busy || tab.running) return;
+  statement.busy = 'count';
+  tab.queryId = newQueryId();
+  try {
+    statement.count = await ipc.queryCount(connection.id, tab.queryId, statement.sql);
+    statement.note = undefined;
+  } catch (e) {
+    const error = asDbError(e);
+    statement.note = [error.message, error.hint].filter(Boolean).join(' ');
+  } finally {
+    statement.busy = undefined;
+    tab.queryId = null;
+  }
+}
+
+/** Replaces the shown result's rows (after edits were applied). */
+export function replaceRows(statement: StatementRun, rows: (string | null)[][]): void {
+  if (statement.result) statement.result = unproxied({ ...statement.result, rows });
+}
+
+/** The EXPLAIN form of a statement for each database. */
+export function explainSql(kind: DbKind, sql: string): string {
+  const body = sql.trim().replace(/;+\s*$/, '');
+  if (kind === 'postgres') return `EXPLAIN (FORMAT JSON) ${body}`;
+  if (kind === 'sqlite') return `EXPLAIN QUERY PLAN ${body}`;
+  return `EXPLAIN ${body}`;
+}
+
+/** Shows the plan of the statement under the cursor, without running it. */
+export async function explain(tab: Tab, selection: EditorSelection): Promise<void> {
+  if (tab.running || tab.generated) return;
+  const connection = connections.byId(tab.connectionId);
+  if (!connection) return;
+  tab.running = true;
+  try {
+    if (!connection.connected && !(await connections.open(connection.id))) return;
+    const selected = selection.from !== selection.to;
+    const source = selected ? tab.text.slice(selection.from, selection.to) : tab.text;
+    const spans = await ipc.sqlSplit(connection.kind, source);
+    const [span] = selected ? spans : statementAtCursor(spans, selection.from);
+    if (!span) return;
+    const statement: StatementRun = {
+      sql: explainSql(connection.kind, source.slice(span.start, span.end)),
+      offset: 0,
+      status: 'running',
+      plan: true,
+    };
+    tab.runs = [statement];
+    tab.shown = 0;
+    const live = tab.runs[0];
+    tab.queryId = newQueryId();
+    try {
+      live.result = unproxied(
+        await ipc.queryRun({
+          connectionId: connection.id,
+          queryId: tab.queryId,
+          sql: live.sql,
+          options: { rowLimit: 0, confirmed: true },
+        }),
+      );
+      live.status = 'done';
+    } catch (e) {
+      live.error = asDbError(e);
+      // Positions refer to the EXPLAIN text, not to the editor.
+      live.error.position = null;
+      live.status = 'failed';
+    }
+  } finally {
+    tab.running = false;
+    tab.queryId = null;
+  }
 }

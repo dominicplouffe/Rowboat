@@ -73,7 +73,6 @@ export const FIELDS: Field[] = [
   {
     section: 'general',
     key: 'restoreTabs',
-    arrives: 'M2',
     kind: 'toggle',
     label: 'Restore tabs on start',
     help: 'Reopen the tabs and unsaved text from your last session.',
@@ -136,7 +135,6 @@ export const FIELDS: Field[] = [
   {
     section: 'appearance',
     key: 'gridFontFamily',
-    arrives: 'M2',
     kind: 'text',
     label: 'Grid font',
     placeholder: 'System monospace',
@@ -145,7 +143,6 @@ export const FIELDS: Field[] = [
   {
     section: 'appearance',
     key: 'gridFontSize',
-    arrives: 'M2',
     kind: 'number',
     label: 'Grid font size',
     min: 8,
@@ -196,7 +193,6 @@ export const FIELDS: Field[] = [
   {
     section: 'editor',
     key: 'autocomplete',
-    arrives: 'M2',
     kind: 'select',
     label: 'Autocomplete',
     options: opts(['typing', 'As you type'], ['on-demand', 'On demand (Ctrl+Space)']),
@@ -205,7 +201,6 @@ export const FIELDS: Field[] = [
   {
     section: 'editor',
     key: 'formatterKeywordCase',
-    arrives: 'M2',
     kind: 'select',
     label: 'Formatter keyword case',
     options: opts(['upper', 'UPPERCASE'], ['lower', 'lowercase'], ['preserve', 'Leave as typed']),
@@ -263,7 +258,6 @@ export const FIELDS: Field[] = [
   {
     section: 'execution',
     key: 'resultMemoryCapMb',
-    arrives: 'M2',
     kind: 'number',
     label: 'Result memory cap',
     min: 16,
@@ -278,7 +272,6 @@ export const FIELDS: Field[] = [
   {
     section: 'results',
     key: 'nullText',
-    arrives: 'M2',
     kind: 'text',
     label: 'NULL display text',
     maxLength: 32,
@@ -287,7 +280,6 @@ export const FIELDS: Field[] = [
   {
     section: 'results',
     key: 'dateTimeFormat',
-    arrives: 'M2',
     kind: 'text',
     label: 'Date/time format',
     placeholder: 'YYYY-MM-DD HH:mm:ss',
@@ -297,7 +289,6 @@ export const FIELDS: Field[] = [
   {
     section: 'results',
     key: 'timeZone',
-    arrives: 'M2',
     kind: 'select',
     label: 'Time zone',
     options: opts(['local', 'Local'], ['utc', 'UTC']),
@@ -306,7 +297,6 @@ export const FIELDS: Field[] = [
   {
     section: 'results',
     key: 'numberFormat',
-    arrives: 'M2',
     kind: 'select',
     label: 'Number format',
     options: opts(['plain', '1234567.89'], ['grouped', '1,234,567.89']),
@@ -315,7 +305,6 @@ export const FIELDS: Field[] = [
   {
     section: 'results',
     key: 'binaryDisplay',
-    arrives: 'M2',
     kind: 'select',
     label: 'Binary display',
     options: opts(['hex', 'Hex'], ['base64', 'Base64']),
@@ -324,7 +313,6 @@ export const FIELDS: Field[] = [
   {
     section: 'results',
     key: 'maxCellChars',
-    arrives: 'M2',
     kind: 'number',
     label: 'Max characters per cell',
     min: 20,
@@ -336,7 +324,6 @@ export const FIELDS: Field[] = [
   {
     section: 'results',
     key: 'jsonAutoDetect',
-    arrives: 'M2',
     kind: 'toggle',
     label: 'Detect JSON in text cells',
     help: 'Open the JSON viewer for any text cell that parses as JSON.',
@@ -433,7 +420,6 @@ export const FIELDS: Field[] = [
   {
     section: 'privacy',
     key: 'keepHistory',
-    arrives: 'M2',
     kind: 'toggle',
     label: 'Keep query history',
     keywords: 'history log',
@@ -441,7 +427,6 @@ export const FIELDS: Field[] = [
   {
     section: 'privacy',
     key: 'historyRetentionDays',
-    arrives: 'M2',
     kind: 'number',
     label: 'History retention',
     min: 1,

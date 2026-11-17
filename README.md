@@ -21,9 +21,11 @@ back rows.
 - **Bring your own model.** Any major LLM provider, or a local model with no key at all.
 
 > **Status: early development.** You can connect to PostgreSQL, ClickHouse and
-> SQLite (with TLS and SSH tunnels), browse the schema, and run and cancel
-> queries with a fetch-time row limit. Autocomplete, paging, editing, export and
-> the AI copilot come next. See the full plan in [docs/SPEC.md](docs/SPEC.md).
+> SQLite (with TLS and SSH tunnels), browse the schema, write SQL with
+> schema-aware autocomplete, run and cancel queries with a fetch-time row limit,
+> page through, sort, filter, edit and export results, and search your query
+> history. The AI copilot comes next. See the full plan in
+> [docs/SPEC.md](docs/SPEC.md).
 
 ## Build from source
 
