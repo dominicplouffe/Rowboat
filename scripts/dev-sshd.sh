@@ -42,6 +42,9 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 AllowTcpForwarding yes
 StrictModes no
+# Without PAM, sshd refuses key logins for an account whose password is
+# locked, which is how CI runners set up their user.
+UsePAM yes
 CONFIG
 
 [ -f "$dir/sshd.pid" ] && $sudo kill "$(cat "$dir/sshd.pid")" 2>/dev/null || true
