@@ -228,7 +228,6 @@ export const FIELDS: Field[] = [
   {
     section: 'execution',
     key: 'queryTimeoutSecs',
-    arrives: 'M1',
     kind: 'number',
     label: 'Query timeout',
     min: 0,
@@ -240,16 +239,14 @@ export const FIELDS: Field[] = [
   {
     section: 'execution',
     key: 'autoCommit',
-    arrives: 'M1',
     kind: 'toggle',
     label: 'Auto-commit by default',
-    help: 'New PostgreSQL and SQLite tabs commit each statement. Turn off to commit or roll back manually.',
+    help: 'How PostgreSQL and SQLite connections start out. Each connection can be switched from its toolbar.',
     keywords: 'transaction commit rollback',
   },
   {
     section: 'execution',
     key: 'stopScriptOnError',
-    arrives: 'M1',
     kind: 'toggle',
     label: 'Stop script on error',
     keywords: 'run script continue',
@@ -257,7 +254,6 @@ export const FIELDS: Field[] = [
   {
     section: 'execution',
     key: 'confirmDestructive',
-    arrives: 'M1',
     kind: 'select',
     label: 'Confirm destructive statements',
     options: opts(['always', 'Always'], ['prod-only', 'Prod connections only'], ['never', 'Never']),
@@ -351,7 +347,6 @@ export const FIELDS: Field[] = [
   {
     section: 'connections',
     key: 'connectTimeoutSecs',
-    arrives: 'M1',
     kind: 'number',
     label: 'Connect timeout',
     min: 1,
@@ -361,7 +356,6 @@ export const FIELDS: Field[] = [
   {
     section: 'connections',
     key: 'keepaliveSecs',
-    arrives: 'M1',
     kind: 'number',
     label: 'Keepalive interval',
     min: 0,
@@ -373,7 +367,6 @@ export const FIELDS: Field[] = [
   {
     section: 'connections',
     key: 'autoReconnect',
-    arrives: 'M1',
     kind: 'toggle',
     label: 'Reconnect automatically',
     help: 'Tabs keep their state.',
@@ -382,7 +375,6 @@ export const FIELDS: Field[] = [
   {
     section: 'connections',
     key: 'sshKnownHosts',
-    arrives: 'M1',
     kind: 'select',
     label: 'SSH known_hosts policy',
     options: opts(

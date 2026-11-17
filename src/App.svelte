@@ -4,6 +4,9 @@
   import StatusBar from './components/StatusBar.svelte';
   import Workspace from './components/Workspace.svelte';
   import { ACTIONS } from './lib/actions';
+  import { connections } from './lib/connections.svelte';
+  import { dialogs } from './lib/dialogs.svelte';
+  import { prompts } from './lib/runner';
   import { ipc } from './lib/ipc';
   import { reportReady } from './lib/ready';
   import { settings } from './lib/settings.svelte';
@@ -15,20 +18,41 @@
   let info = $state<AppInfo | null>(null);
   let loadError = $state<string | null>(null);
 
-  const WELCOME = `-- Welcome to Rowboat.
--- Connections arrive in the next milestone; for now, try the editor and Settings.
+  // Prompts raised by the core's safety checks are answered here.
+  prompts.confirmDestructive = (sql, reason, connectionName) =>
+    dialogs.confirm({
+      title: `Run this on ${connectionName}?`,
+      message: reason,
+      detail: sql.length > 1200 ? `${sql.slice(0, 1200)}…` : sql,
+      confirmLabel: 'Run it',
+      danger: true,
+      prod: connections.list.find((c) => c.name === connectionName)?.environment === 'prod',
+    });
+  connections.askHostKey = (prompt) =>
+    dialogs.confirm({
+      title: 'Trust this SSH server?',
+      message: `${prompt.message} Check the fingerprint with whoever runs the server. If you trust it, it is added to known_hosts.`,
+      detail: `${prompt.keyType}\n${prompt.fingerprint}`,
+      confirmLabel: 'Trust and connect',
+    });
 
-SELECT o.id, c.name, o.total
-FROM orders AS o
-JOIN customers AS c ON c.id = o.customer_id
-WHERE o.created_at >= now() - interval '7 days'
-ORDER BY o.total DESC;
+  const WELCOME = `-- Welcome to Rowboat.
+-- Add a connection in the sidebar, then run a statement with Ctrl/⌘+Enter.
+
+SELECT 1;
 `;
 
   onMount(async () => {
     try {
-      await settings.load();
-      tabs.open(settings.value!.execution.defaultRowLimit, WELCOME);
+      await Promise.all([settings.load(), connections.load()]);
+      tabs.open(
+        settings.value!.execution.defaultRowLimit,
+        connections.list.length === 0 ? WELCOME : '',
+        {
+          // With a single connection there is nothing to choose.
+          connectionId: connections.list.length === 1 ? connections.list[0].id : null,
+        },
+      );
     } catch (e) {
       loadError = String(e);
     }
@@ -41,7 +65,7 @@ ORDER BY o.total DESC;
   });
 
   function onKeydown(event: KeyboardEvent) {
-    if (ui.settingsOpen) return; // The dialog handles its own keys.
+    if (ui.settingsOpen || dialogs.anyOpen) return; // Dialogs handle their own keys.
     const chord = chordFromEvent(event);
     if (!chord) return;
     const action = findAction(ACTIONS, settings.value?.keyboard.overrides ?? {}, chord);
@@ -75,6 +99,16 @@ ORDER BY o.total DESC;
     </div>
     <StatusBar {info} />
   </div>
+  {#if dialogs.connection}
+    {#await import('./components/ConnectionDialog.svelte') then { default: ConnectionDialog }}
+      <ConnectionDialog />
+    {/await}
+  {/if}
+  {#if dialogs.confirmRequest}
+    {#await import('./components/ConfirmDialog.svelte') then { default: ConfirmDialog }}
+      {#key dialogs.confirmRequest}<ConfirmDialog />{/key}
+    {/await}
+  {/if}
   {#if ui.settingsOpen}
     {#await import('./components/SettingsDialog.svelte') then { default: SettingsDialog }}
       <SettingsDialog {info} />

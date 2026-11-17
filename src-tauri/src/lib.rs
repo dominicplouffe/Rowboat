@@ -3,18 +3,30 @@
 //! All database, AI and secret handling lives on this side of the IPC boundary;
 //! the webview only renders. M0 provides the settings store and app metadata.
 
+pub mod connections;
+pub mod db;
 pub mod error;
+pub mod manager;
+pub mod secrets;
 pub mod settings;
+pub mod ssh;
+pub mod statements;
+pub mod tls;
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use serde::Serialize;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Manager as _, State};
 use tauri_plugin_dialog::DialogExt;
 
+use connections::{AppDb, ConnectionConfig};
+use db::{DbKind, DbResult, SchemaNode};
 use error::{Error, Result};
+use manager::{ConnectionView, Manager, RunResult, SecretInput};
+use secrets::Secrets;
 use settings::{Settings, SettingsStore};
+use statements::StatementSpan;
 
 /// When set, the app writes its startup time to this file and exits once the
 /// window is usable. Used by `scripts/check-startup-budget.mjs`; a local
@@ -32,18 +44,27 @@ struct AppInfo {
     arch: &'static str,
     default_client_id: String,
     settings_path: String,
+    /// False when there is no OS keychain and secrets last only until quit.
+    secrets_persistent: bool,
 }
 
 #[tauri::command]
-fn app_info(app: AppHandle, store: State<'_, SettingsStore>) -> AppInfo {
-    AppInfo {
+async fn app_info(
+    app: AppHandle,
+    store: State<'_, SettingsStore>,
+    manager: State<'_, Manager>,
+) -> Result<AppInfo> {
+    // Async on purpose: finding out whether a keychain exists can take a
+    // moment and must not run on the main thread.
+    Ok(AppInfo {
         name: "Rowboat",
         version: app.package_info().version.to_string(),
         os: std::env::consts::OS,
         arch: std::env::consts::ARCH,
         default_client_id: settings::default_client_id(),
         settings_path: store.path().display().to_string(),
-    }
+        secrets_persistent: manager.secrets_are_persistent(),
+    })
 }
 
 /// Milliseconds since the harness launched this process, if it told us when
@@ -154,6 +175,158 @@ fn open_data_folder(store: State<'_, SettingsStore>) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------- connections ----
+//
+// Secrets only ever flow inwards through these commands (`SecretInput`);
+// nothing returned to the webview contains one.
+
+#[tauri::command]
+async fn connections_list(manager: State<'_, Manager>) -> DbResult<Vec<ConnectionView>> {
+    manager.list().await
+}
+
+#[tauri::command]
+async fn connection_save(
+    manager: State<'_, Manager>,
+    config: ConnectionConfig,
+    secrets: SecretInput,
+) -> DbResult<ConnectionView> {
+    manager.save(config, secrets).await
+}
+
+#[tauri::command]
+async fn connection_delete(manager: State<'_, Manager>, id: String) -> DbResult<()> {
+    manager.delete(&id).await
+}
+
+/// Tries a connection without saving it. Returns the server version.
+#[tauri::command]
+async fn connection_test(
+    manager: State<'_, Manager>,
+    store: State<'_, SettingsStore>,
+    config: ConnectionConfig,
+    secrets: SecretInput,
+    trusted_fingerprint: Option<String>,
+) -> DbResult<String> {
+    manager
+        .test(config, secrets, &store.get(), trusted_fingerprint)
+        .await
+}
+
+#[tauri::command]
+async fn connection_open(
+    manager: State<'_, Manager>,
+    store: State<'_, SettingsStore>,
+    id: String,
+    trusted_fingerprint: Option<String>,
+) -> DbResult<ConnectionView> {
+    manager.open(&id, &store.get(), trusted_fingerprint).await
+}
+
+#[tauri::command]
+async fn connection_close(manager: State<'_, Manager>, id: String) -> DbResult<()> {
+    manager.close(&id).await;
+    Ok(())
+}
+
+/// Runs one statement. The AI never calls this: only the Run actions do.
+#[tauri::command]
+async fn query_run(
+    manager: State<'_, Manager>,
+    store: State<'_, SettingsStore>,
+    connection_id: String,
+    query_id: String,
+    sql: String,
+    row_limit: u32,
+    confirmed: bool,
+) -> DbResult<RunResult> {
+    manager
+        .run(
+            &connection_id,
+            &query_id,
+            &sql,
+            row_limit,
+            confirmed,
+            &store.get(),
+        )
+        .await
+}
+
+#[tauri::command]
+async fn query_cancel(manager: State<'_, Manager>, query_id: String) -> DbResult<()> {
+    manager.cancel(&query_id).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn transaction_end(
+    manager: State<'_, Manager>,
+    connection_id: String,
+    commit: bool,
+) -> DbResult<()> {
+    manager.end_transaction(&connection_id, commit).await
+}
+
+#[tauri::command]
+async fn connection_set_auto_commit(
+    manager: State<'_, Manager>,
+    connection_id: String,
+    auto_commit: bool,
+) -> DbResult<()> {
+    manager.set_auto_commit(&connection_id, auto_commit).await
+}
+
+#[tauri::command]
+async fn schema_children(
+    manager: State<'_, Manager>,
+    connection_id: String,
+    path: Vec<String>,
+) -> DbResult<Vec<SchemaNode>> {
+    manager.children(&connection_id, &path).await
+}
+
+#[tauri::command]
+async fn schema_ddl(
+    manager: State<'_, Manager>,
+    connection_id: String,
+    path: Vec<String>,
+) -> DbResult<String> {
+    manager.ddl(&connection_id, &path).await
+}
+
+/// Splits editor text into statements (offsets in UTF-16 code units).
+#[tauri::command]
+fn sql_split(kind: DbKind, text: String) -> Vec<StatementSpan> {
+    statements::split(kind, &text)
+}
+
+/// Opens a native file dialog and returns the chosen path. The dialog runs in
+/// Rust, so the webview needs no filesystem access.
+#[tauri::command]
+async fn pick_file(app: AppHandle, purpose: String) -> Result<Option<String>> {
+    let dialog = app.dialog().file();
+    let picked = match purpose.as_str() {
+        "sqlite-new" => dialog
+            .set_title("Create a SQLite database")
+            .set_file_name("database.sqlite")
+            .blocking_save_file(),
+        "sqlite-open" => dialog
+            .set_title("Open a SQLite database")
+            .add_filter("SQLite", &["sqlite", "sqlite3", "db", "db3"])
+            .add_filter("All files", &["*"])
+            .blocking_pick_file(),
+        "certificate" => dialog
+            .set_title("Choose a certificate (PEM)")
+            .add_filter("Certificates", &["pem", "crt", "cer", "key"])
+            .add_filter("All files", &["*"])
+            .blocking_pick_file(),
+        _ => dialog.set_title("Choose a file").blocking_pick_file(),
+    };
+    Ok(picked
+        .and_then(|p| p.into_path().ok())
+        .map(|p| p.display().to_string()))
+}
+
 /// The macOS menu bar. Tauri's default menu binds ⌘W to "Close Window", which
 /// would steal the shortcut from "Close tab"; this one leaves ⌘W to the app and
 /// keeps the Edit menu, which macOS needs for ⌘C/⌘V/⌘Z to work in the webview.
@@ -207,6 +380,7 @@ fn macos_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
 
 pub fn run() {
     let started = StartedAt(Instant::now());
+    tls::ensure_provider();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -217,6 +391,13 @@ pub fn run() {
                 None => app.path().app_config_dir()?,
             };
             app.manage(SettingsStore::load(dir.join("settings.json")));
+            // Tests and benchmarks must not touch the user's real keychain.
+            let secrets = if std::env::var_os("ROWBOAT_CONFIG_DIR").is_some() {
+                Secrets::in_memory()
+            } else {
+                Secrets::system()
+            };
+            app.manage(Manager::new(AppDb::open(dir.join("rowboat.db"))?, secrets));
             #[cfg(target_os = "macos")]
             app.set_menu(macos_menu(app.handle())?)?;
             Ok(())
@@ -230,6 +411,20 @@ pub fn run() {
             settings_export,
             settings_import,
             open_data_folder,
+            connections_list,
+            connection_save,
+            connection_delete,
+            connection_test,
+            connection_open,
+            connection_close,
+            query_run,
+            query_cancel,
+            transaction_end,
+            connection_set_auto_commit,
+            schema_children,
+            schema_ddl,
+            sql_split,
+            pick_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Rowboat");
