@@ -62,9 +62,66 @@ Until then, build from source (below).
 
 ## Build from source
 
-You need [Node.js](https://nodejs.org) 22+, [Rust](https://rustup.rs) (stable), and the
-[Tauri prerequisites](https://tauri.app/start/prerequisites/) for your OS (on macOS: Xcode
-Command Line Tools).
+There is no installer yet, so this is how to get Rowboat running. You need three things: your
+platform's build tools, [Rust](https://rustup.rs) and [Node.js](https://nodejs.org) 22 or newer.
+
+### 1. Install the build tools
+
+**macOS.** Install the Xcode Command Line Tools (the full Xcode app is not needed). A dialog
+opens; choose **Install** and wait for it to finish:
+
+```bash
+xcode-select --install
+```
+
+**Windows.** Install the
+[Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) and
+select the "Desktop development with C++" workload. WebView2 is already part of Windows 10
+(version 1803 and later) and Windows 11.
+
+**Debian / Ubuntu.** Other distributions are covered in the
+[Tauri prerequisites](https://tauri.app/start/prerequisites/).
+
+```bash
+sudo apt-get update
+```
+
+```bash
+sudo apt-get install -y build-essential pkg-config file patchelf rpm libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libxdo-dev
+```
+
+### 2. Install Rust
+
+macOS and Linux (accept the default installation when asked):
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+On Windows, download and run `rustup-init.exe` from [rustup.rs](https://rustup.rs).
+
+### 3. Install Node.js 22 or newer
+
+Download the installer from [nodejs.org](https://nodejs.org), or on macOS with
+[Homebrew](https://brew.sh):
+
+```bash
+brew install node
+```
+
+### 4. Check the tools
+
+Open a **new** terminal so the freshly installed tools are found, then check each one answers:
+
+```bash
+rustc --version
+```
+
+```bash
+node --version
+```
+
+### 5. Get the code and run it
 
 ```bash
 git clone https://github.com/dominicplouffe/Rowboat.git
@@ -82,7 +139,14 @@ npm install
 npm run tauri dev
 ```
 
-To build an installer for your platform (in `src-tauri/target/release/bundle/`):
+The first run compiles the Rust core, which takes several minutes; later runs take seconds. The
+Rowboat window opens when it is done, starting with a short setup. Choose **Open the sample
+database** on its last step to have something to query straight away.
+
+### Build an installer
+
+This builds the app and an installer for your platform (a `.dmg` on macOS) into
+`src-tauri/target/release/bundle/`:
 
 ```bash
 npm run tauri build
