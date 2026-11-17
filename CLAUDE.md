@@ -11,6 +11,10 @@ The product spec is `docs/SPEC.md`. Read it before changing behavior. Its
 Built milestone by milestone (spec → "Milestones"), one branch and one PR each.
 
 - [x] **M0 Foundation** — app scaffold, settings store, brand assets, CI + release workflows
+  - The workflows are staged in `.github/workflows.pending/` until someone with
+    the GitHub `workflow` permission moves them to `.github/workflows/` (see the
+    README there). Until then CI has never run: macOS and Windows builds are
+    unverified.
 - [ ] M1 Connections — drivers, TLS/SSH, keychain secrets, run and cancel
 - [ ] M2 Editor — autocomplete, virtual grid, row limits at fetch, JSON viewer, history, export
 - [ ] M3 AI copilot — providers, schema index, fix on error, onboarding wizard
@@ -67,7 +71,7 @@ src-tauri/
 assets/brand/            Logo sources: icon.svg (master), logo.svg (mark), glyph.svg (16–32 px).
 packaging/arch/          PKGBUILD for the AUR package rowboat-sql-bin + validate.sh.
 scripts/                 Budget checks, version check, brand generator.
-.github/workflows/       ci.yml (every push/PR), release.yml (tag v*), actions/setup.
+.github/                 workflows: ci.yml (every push/PR), release.yml (tag v*); actions/setup.
 ```
 
 How a setting flows: UI control → `settings.set()` → `ipc.settingsSet` → Rust
