@@ -3,7 +3,11 @@
 //! All database, AI and secret handling lives on this side of the IPC boundary;
 //! the webview only renders. M0 provides the settings store and app metadata.
 
+pub mod connections;
+pub mod db;
 pub mod error;
+pub mod statements;
+pub mod tls;
 pub mod settings;
 
 use std::path::PathBuf;
