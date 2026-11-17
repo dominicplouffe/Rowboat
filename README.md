@@ -1,0 +1,128 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/logo-wordmark-dark.svg">
+    <img src="assets/brand/logo-wordmark-light.svg" alt="Rowboat" height="72">
+  </picture>
+</p>
+
+<p align="center">A fast, lightweight SQL client with an AI copilot that knows your schema.</p>
+
+---
+
+Rowboat is a SQL client for macOS, Windows and Linux. v0.1 targets PostgreSQL,
+ClickHouse and SQLite, with a first-class editor and data grid and nothing that
+slows startup. The name is one word: **Row**boat, because every query brings
+back rows.
+
+- **Fast first.** Cold start under 1 s, idle memory under 150 MB, installer under 20 MB.
+- **Keyboard-first, mouse-friendly.** Every action has a shortcut; nothing requires one.
+- **AI is a copilot, not an autopilot.** AI-generated SQL never runs until you press Run.
+- **Safe by default.** Secrets live in the OS keychain. No account, no telemetry, no crash reports.
+- **Bring your own model.** Any major LLM provider, or a local model with no key at all.
+
+> **Status: v0.1 is feature-complete and not yet released.** Everything below
+> works on Linux, where it was built and tested. It has not been built on macOS
+> or Windows yet, ClickHouse has not been run against a real server, and the
+> copilot has not been run against real AI providers. Where each acceptance
+> criterion stands is in [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md).
+
+## What it does
+
+- **Connects** to PostgreSQL, ClickHouse and SQLite, with TLS and SSH tunnels.
+  Passwords live in the OS keychain.
+- **Editor** with schema-aware autocomplete (aliases, CTEs, foreign-key joins),
+  a formatter, EXPLAIN, history and `.sql` files.
+- **Results** limited at fetch time (1,000 rows by default, one click to
+  change), with paging, sorting, filtering, a JSON viewer, inline editing and
+  streaming export to CSV, JSON, SQL and more.
+- **AI copilot** that writes, fixes and explains SQL using your schema, with
+  the provider you choose: OpenAI, Anthropic, Gemini, DeepSeek, Mistral, xAI,
+  OpenRouter, Azure OpenAI, a local Ollama or LM Studio, or any
+  OpenAI-compatible endpoint. It never runs SQL itself and never sends your
+  rows.
+
+The [user guide](docs/USER_GUIDE.md) covers all of it, including exactly what
+the copilot sends and where your data is stored.
+
+## Install
+
+There is no release to download yet. Once there is, installers will be on the
+[Releases page](https://github.com/dominicplouffe/Rowboat/releases):
+
+| Platform                        | File                                                 |
+| ------------------------------- | ---------------------------------------------------- |
+| macOS (Apple Silicon and Intel) | `.dmg`                                               |
+| Windows                         | `.msi` or `-setup.exe`                               |
+| Debian / Ubuntu                 | `.deb`                                               |
+| Fedora / RHEL                   | `.rpm`                                               |
+| Any Linux                       | `.AppImage`                                          |
+| Arch Linux                      | `yay -S rowboat-sql-bin` (once published to the AUR) |
+
+Until then, build from source (below).
+
+## Build from source
+
+You need [Node.js](https://nodejs.org) 22+, [Rust](https://rustup.rs) (stable), and the
+[Tauri prerequisites](https://tauri.app/start/prerequisites/) for your OS (on macOS: Xcode
+Command Line Tools).
+
+```bash
+git clone https://github.com/dominicplouffe/Rowboat.git
+```
+
+```bash
+cd Rowboat
+```
+
+```bash
+npm install
+```
+
+```bash
+npm run tauri dev
+```
+
+To build an installer for your platform (in `src-tauri/target/release/bundle/`):
+
+```bash
+npm run tauri build
+```
+
+Builds are unsigned for now, so macOS Gatekeeper and Windows SmartScreen will warn about
+downloaded installers. On macOS, right-click the app and choose **Open** the first time, or clear
+the quarantine flag:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Rowboat.app
+```
+
+## Development
+
+| Task                                    | Command                                             |
+| --------------------------------------- | --------------------------------------------------- |
+| Frontend tests                          | `npm test`                                          |
+| Rust tests                              | `cd src-tauri && cargo test`                        |
+| Types and lint                          | `npm run check && npm run lint`                     |
+| PostgreSQL + ClickHouse for integration | `docker compose up -d --wait`                       |
+| Integration tests                       | `cd src-tauri && cargo test --features integration` |
+| Performance budgets                     | `npm run budget:bundle`, `npm run budget:startup`   |
+| Installer size budget                   | `npm run budget:installer`                          |
+| Regenerate icons from the logo          | `npm run icons`                                     |
+
+Architecture notes and project rules live in [CLAUDE.md](CLAUDE.md). Other docs:
+[product spec](docs/SPEC.md), [user guide](docs/USER_GUIDE.md),
+[acceptance status](docs/ACCEPTANCE.md), [releasing](docs/RELEASING.md),
+[code signing](docs/SIGNING.md), [changelog](CHANGELOG.md).
+
+## Privacy
+
+No account, no telemetry, no crash reports, and the app loads no remote content. Rowboat talks to
+your databases, to the AI provider you set up (only when you use the copilot), and to GitHub for
+an update check that sends nothing about you and can be turned off.
+
+## License
+
+[MIT](LICENSE) © Dominic Plouffe
+
+Rowboat is not affiliated with Rowboat Labs or its Rowboat application. Packages whose names must
+be unique use `rowboat-sql` (for example the AUR package `rowboat-sql-bin`).

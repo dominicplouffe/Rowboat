@@ -1,0 +1,182 @@
+name: CI
+
+# Runs on every push and every pull request. Needs no secrets: installers are
+# built unsigned (macOS gets an ad-hoc signature).
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # A pull request from a branch of this repository is already covered by that
+  # branch's push run, so every job skips it; pull requests from forks still run.
+  lint:
+    name: Lint
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+        with:
+          rust-components: rustfmt, clippy
+      - name: Versions agree (package.json, Cargo.toml, tauri.conf.json, PKGBUILD)
+        run: node scripts/check-version.mjs
+      - name: ESLint and Prettier
+        run: npm run lint
+      - name: svelte-check
+        run: npm run check
+      - name: cargo fmt
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - name: Build the frontend (the Rust crate embeds dist/)
+        run: npm run build
+      - name: cargo clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --features integration -- -D warnings
+
+  test:
+    name: Test (${{ matrix.name }})
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux, os: ubuntu-22.04 }
+          - { name: macOS, os: macos-latest }
+          - { name: Windows, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: Vitest
+        run: npm test
+      - name: Build the frontend (the Rust crate embeds dist/)
+        run: npm run build
+      - name: cargo test
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  integration:
+    name: Integration (PostgreSQL, ClickHouse, SSH)
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      # The same docker-compose.yml developers use locally, so the two cannot drift.
+      - name: Start PostgreSQL and ClickHouse
+        run: docker compose up -d --wait
+      - name: Build the frontend (the Rust crate embeds dist/)
+        run: npm run build
+      # A throwaway sshd on 127.0.0.1 with a fresh key, for the tunnel tests.
+      - name: Start sshd
+        run: scripts/dev-sshd.sh | sed 's/^export //' >> "$GITHUB_ENV"
+      # The PostgreSQL TLS tests need a server with certificates and are
+      # skipped here; they are run locally (see src-tauri/tests/postgres.rs).
+      - name: Integration tests
+        run: >-
+          cargo test --manifest-path src-tauri/Cargo.toml --features integration
+          --test services --test postgres --test clickhouse --test ssh
+      - name: Service logs
+        if: failure()
+        run: docker compose logs
+      - name: Stop services
+        if: always()
+        run: docker compose down -v
+
+  build:
+    name: Build (${{ matrix.name }})
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Same targets as release.yml, so packaging problems show up here first.
+          - name: macOS
+            os: macos-latest
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            args: --target universal-apple-darwin
+            startup-budget-ms: 2500
+          - name: Windows
+            os: windows-latest
+            rust-targets: ''
+            args: ''
+            startup-budget-ms: 4000
+          - name: Linux
+            os: ubuntu-22.04
+            rust-targets: ''
+            args: ''
+            startup-budget-ms: 2500
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+        with:
+          rust-targets: ${{ matrix.rust-targets }}
+
+      - name: Build installers (unsigned)
+        run: npm run tauri build -- ${{ matrix.args }}
+
+      - name: 'Budget: initial JS bundle < 400 KB gzipped'
+        run: npm run budget:bundle
+
+      - name: 'Budget: installer < 20 MB'
+        run: npm run budget:installer
+
+      # The spec's cold-start target is < 1 s on a 2021+ laptop. Hosted runners
+      # are shared VMs without a GPU, so CI holds each platform to a looser
+      # number that still catches regressions; run `npm run budget:startup` on
+      # real hardware for the 1 s check. Linux also checks idle memory < 150 MB
+      # (private memory; see scripts/check-startup-budget.mjs).
+      - name: 'Budget: cold start and idle memory'
+        shell: bash
+        env:
+          STARTUP_BUDGET_MS: ${{ matrix.startup-budget-ms }}
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # Runners have no GPU. WebKitGTK would fall back to software GL
+            # (llvmpipe), which adds ~130 MB that no user with a GPU pays, so
+            # the measurement uses WebKit's non-GL renderer instead.
+            WEBKIT_DISABLE_DMABUF_RENDERER=1 xvfb-run -a npm run budget:startup
+          else
+            npm run budget:startup
+          fi
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v7
+        with:
+          name: rowboat-${{ matrix.name }}
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            src-tauri/target/**/release/bundle/dmg/*.dmg
+            src-tauri/target/**/release/bundle/msi/*.msi
+            src-tauri/target/**/release/bundle/nsis/*.exe
+            src-tauri/target/**/release/bundle/deb/*.deb
+            src-tauri/target/**/release/bundle/rpm/*.rpm
+            src-tauri/target/**/release/bundle/appimage/*.AppImage
+
+  arch:
+    name: Arch Linux (makepkg)
+    needs: build
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: rowboat-Linux
+          path: installers
+      - name: Build and install rowboat-sql-bin from the .deb built above
+        run: bash packaging/arch/validate.sh "$(find installers -name '*.deb' | head -n 1)" arch-out
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rowboat-arch
+          retention-days: 14
+          path: arch-out/

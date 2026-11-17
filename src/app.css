@@ -1,0 +1,218 @@
+/* Rowboat's whole design system: a few tokens, no UI kit. */
+
+:root {
+  color-scheme: light;
+  --bg: #ffffff;
+  --bg-subtle: #f4f7fa;
+  --bg-inset: #eaeff4;
+  --bg-hover: rgba(14, 42, 71, 0.06);
+  --bg-active: rgba(45, 156, 219, 0.14);
+  --border: #dde4ec;
+  --border-strong: #c3cedb;
+  --text: #0e2a47;
+  --text-muted: #5a6b7f;
+  --text-faint: #8695a6;
+  --accent: #1a7fbd;
+  --accent-text: #ffffff;
+  --focus: #2d9cdb;
+  --danger: #c0392b;
+  --logo-ink: #0e2a47;
+  --shadow: 0 12px 40px rgba(14, 42, 71, 0.22);
+
+  --syn-keyword: #1668a8;
+  --syn-string: #a3540b;
+  --syn-number: #7a3fb0;
+  --syn-comment: #7b8794;
+  --syn-type: #0b7a6e;
+  --syn-operator: #51606f;
+  --syn-name: #0e2a47;
+
+  --ui-font: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+  --editor-font: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, monospace;
+  --editor-font-size: 13px;
+  --grid-font: var(--editor-font);
+  --grid-font-size: 12px;
+
+  --row: 28px;
+  --pad: 10px;
+  --radius: 6px;
+}
+
+:root[data-density='compact'] {
+  --row: 24px;
+  --pad: 7px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+    --bg: #101822;
+    --bg-subtle: #0b121a;
+    --bg-inset: #18222e;
+    --bg-hover: rgba(230, 237, 245, 0.07);
+    --bg-active: rgba(45, 156, 219, 0.22);
+    --border: #212d3b;
+    --border-strong: #33435a;
+    --text: #e6edf5;
+    --text-muted: #9aabbd;
+    --text-faint: #6c7d90;
+    --accent: #4aaee6;
+    --accent-text: #06121d;
+    --danger: #f0796b;
+    --logo-ink: #dbe7f3;
+    --shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
+    --syn-keyword: #6cbcf0;
+    --syn-string: #f0b266;
+    --syn-number: #c79bf0;
+    --syn-comment: #6c7d90;
+    --syn-type: #5fd0c0;
+    --syn-operator: #9aabbd;
+    --syn-name: #e6edf5;
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #101822;
+  --bg-subtle: #0b121a;
+  --bg-inset: #18222e;
+  --bg-hover: rgba(230, 237, 245, 0.07);
+  --bg-active: rgba(45, 156, 219, 0.22);
+  --border: #212d3b;
+  --border-strong: #33435a;
+  --text: #e6edf5;
+  --text-muted: #9aabbd;
+  --text-faint: #6c7d90;
+  --accent: #4aaee6;
+  --accent-text: #06121d;
+  --danger: #f0796b;
+  --logo-ink: #dbe7f3;
+  --shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
+  --syn-keyword: #6cbcf0;
+  --syn-string: #f0b266;
+  --syn-number: #c79bf0;
+  --syn-comment: #6c7d90;
+  --syn-type: #5fd0c0;
+  --syn-operator: #9aabbd;
+  --syn-name: #e6edf5;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.4 var(--ui-font);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: default;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+/* Shared controls */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--row);
+  padding: 0 var(--pad);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg);
+  white-space: nowrap;
+}
+.btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+.btn:disabled {
+  color: var(--text-faint);
+  border-color: var(--border);
+}
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+.btn.primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+  background: var(--accent);
+}
+.btn.primary:disabled {
+  opacity: 0.45;
+  color: var(--accent-text);
+}
+.btn.ghost {
+  border-color: transparent;
+  background: transparent;
+}
+.btn.icon {
+  width: var(--row);
+  padding: 0;
+  justify-content: center;
+}
+
+.input {
+  height: var(--row);
+  padding: 0 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg);
+  user-select: text;
+  -webkit-user-select: text;
+  min-width: 0;
+}
+.input:focus-visible {
+  outline-offset: -1px;
+}
+
+kbd {
+  font: 11px var(--ui-font);
+  padding: 1px 6px;
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--bg-subtle);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
+}
