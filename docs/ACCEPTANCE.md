@@ -23,15 +23,15 @@ never run, so no criterion is met on all three platforms yet.
 
 Measured locally on the Linux build machine (a VM without a GPU).
 
-| Metric                        | Target                 | Measured                                        | Enforced by                                                              |
-| ----------------------------- | ---------------------- | ----------------------------------------------- | ------------------------------------------------------------------------ |
-| Cold start to usable window   | < 1 s                  | 0.93 s (everyday launch), 0.92 s (first launch) | `npm run budget:startup`                                                 |
-| Idle memory, app + webview    | < 150 MB               | 77 MB private                                   | `npm run budget:startup` (Linux)                                         |
-| Installer size                | < 20 MB                | see the M4 pull request                         | `npm run budget:installer`                                               |
-| Initial JS bundle             | < 400 KB gzipped       | 55 KB                                           | `npm run budget:bundle`                                                  |
-| Autocomplete latency          | < 30 ms p95            | under budget on 500 tables                      | Vitest (`complete.test.ts`)                                              |
-| Grid scrolling with 100k rows | 60 fps                 | not measured as a frame rate                    | Vitest (`Grid.test.ts`) checks that only the rows in view are in the DOM |
-| Result memory                 | capped, default 256 MB | cap enforced while fetching                     | Rust tests                                                               |
+| Metric                        | Target                 | Measured                                                                         | Enforced by                                                              |
+| ----------------------------- | ---------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| Cold start to usable window   | < 1 s                  | 0.93 s (everyday launch), 0.92 s (first launch)                                  | `npm run budget:startup`                                                 |
+| Idle memory, app + webview    | < 150 MB               | 77 MB private                                                                    | `npm run budget:startup` (Linux)                                         |
+| Installer size                | < 20 MB                | 5.8 MB (`.deb`, `.rpm`); the 81 MB AppImage is exempt: it carries its own WebKit | `npm run budget:installer`                                               |
+| Initial JS bundle             | < 400 KB gzipped       | 55 KB                                                                            | `npm run budget:bundle`                                                  |
+| Autocomplete latency          | < 30 ms p95            | under budget on 500 tables                                                       | Vitest (`complete.test.ts`)                                              |
+| Grid scrolling with 100k rows | 60 fps                 | not measured as a frame rate                                                     | Vitest (`Grid.test.ts`) checks that only the rows in view are in the DOM |
+| Result memory                 | capped, default 256 MB | cap enforced while fetching                                                      | Rust tests                                                               |
 
 Cold start has little headroom: about 70 ms on this machine. The frame rate of
 the grid has not been measured on a real display.
