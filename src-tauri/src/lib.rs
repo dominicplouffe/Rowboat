@@ -6,6 +6,8 @@
 pub mod connections;
 pub mod db;
 pub mod error;
+pub mod secrets;
+pub mod ssh;
 pub mod statements;
 pub mod tls;
 pub mod settings;
