@@ -5,7 +5,9 @@
 
 pub mod connections;
 pub mod db;
+pub mod edits;
 pub mod error;
+pub mod export;
 pub mod manager;
 pub mod secrets;
 pub mod settings;
@@ -20,10 +22,10 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager as _, State};
 use tauri_plugin_dialog::DialogExt;
 
-use connections::{AppDb, ConnectionConfig};
-use db::{DbKind, DbResult, SchemaNode};
+use connections::{AppDb, ConnectionConfig, HistoryEntry};
+use db::{DbKind, DbResult, SchemaNode, SchemaSnapshot};
 use error::{Error, Result};
-use manager::{ConnectionView, Manager, RunResult, SecretInput};
+use manager::{ConnectionView, Manager, RunOptions, RunResult, SecretInput};
 use secrets::Secrets;
 use settings::{Settings, SettingsStore};
 use statements::StatementSpan;
@@ -237,19 +239,217 @@ async fn query_run(
     connection_id: String,
     query_id: String,
     sql: String,
-    row_limit: u32,
-    confirmed: bool,
+    options: RunOptions,
 ) -> DbResult<RunResult> {
     manager
-        .run(
-            &connection_id,
-            &query_id,
-            &sql,
-            row_limit,
-            confirmed,
-            &store.get(),
-        )
+        .run_with(&connection_id, &query_id, &sql, options, &store.get())
         .await
+}
+
+/// Counts the rows a query returns without fetching them.
+#[tauri::command]
+async fn query_count(
+    manager: State<'_, Manager>,
+    store: State<'_, SettingsStore>,
+    connection_id: String,
+    query_id: String,
+    sql: String,
+) -> DbResult<u64> {
+    manager
+        .count(&connection_id, &query_id, &sql, &store.get())
+        .await
+}
+
+#[tauri::command]
+async fn schema_snapshot(
+    manager: State<'_, Manager>,
+    connection_id: String,
+) -> DbResult<SchemaSnapshot> {
+    manager.snapshot(&connection_id).await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Exported {
+    path: String,
+    rows: u64,
+}
+
+fn export_dialog(app: &AppHandle, format: export::Format, name: &str) -> Option<PathBuf> {
+    let extension = format.extension();
+    app.dialog()
+        .file()
+        .set_title("Export results")
+        .set_file_name(format!("{name}.{extension}"))
+        .add_filter(extension.to_uppercase(), &[extension])
+        .blocking_save_file()
+        .and_then(|p| p.into_path().ok())
+}
+
+/// Runs `sql` again without a row limit and streams every row to a file the
+/// user picks. Resolves to `None` when the dialog is cancelled.
+#[tauri::command]
+async fn export_query(
+    app: AppHandle,
+    manager: State<'_, Manager>,
+    connection_id: String,
+    query_id: String,
+    sql: String,
+    format: export::Format,
+    table: String,
+) -> DbResult<Option<Exported>> {
+    let Some(path) = export_dialog(&app, format, "export") else {
+        return Ok(None);
+    };
+    let rows = manager
+        .export_query(&connection_id, &query_id, &sql, &path, format, &table)
+        .await?;
+    Ok(Some(Exported {
+        path: path.display().to_string(),
+        rows,
+    }))
+}
+
+/// Writes rows the UI already holds (the current page) to a file.
+#[tauri::command]
+async fn export_page(
+    app: AppHandle,
+    format: export::Format,
+    kind: DbKind,
+    table: String,
+    columns: Vec<db::Column>,
+    rows: Vec<Vec<Option<String>>>,
+) -> DbResult<Option<Exported>> {
+    use db::RowSink;
+    let Some(path) = export_dialog(&app, format, "export") else {
+        return Ok(None);
+    };
+    let write = || -> std::io::Result<()> {
+        let file = std::io::BufWriter::new(std::fs::File::create(&path)?);
+        let mut writer = export::Writer::new(
+            file,
+            export::Options {
+                format,
+                kind,
+                table,
+            },
+        );
+        writer.start(&columns)?;
+        for row in &rows {
+            writer.row(row)?;
+        }
+        writer.finish()
+    };
+    write().map_err(|e| db::DbError::other(format!("Could not write {}: {e}", path.display())))?;
+    Ok(Some(Exported {
+        path: path.display().to_string(),
+        rows: rows.len() as u64,
+    }))
+}
+
+/// The UPDATE statements Apply would run, for "Preview SQL".
+#[tauri::command]
+async fn edits_preview(
+    manager: State<'_, Manager>,
+    connection_id: String,
+    target: db::EditTarget,
+    edits: Vec<edits::RowEdit>,
+) -> DbResult<Vec<String>> {
+    manager.edits_preview(&connection_id, &target, &edits).await
+}
+
+/// Applies staged edits in one transaction. Returns the number of rows updated.
+#[tauri::command]
+async fn edits_apply(
+    manager: State<'_, Manager>,
+    connection_id: String,
+    query_id: String,
+    target: db::EditTarget,
+    edits: Vec<edits::RowEdit>,
+) -> DbResult<u64> {
+    manager
+        .edits_apply(&connection_id, &query_id, &target, &edits)
+        .await
+}
+
+#[tauri::command]
+fn history_search(
+    manager: State<'_, Manager>,
+    connection_id: Option<String>,
+    search: String,
+    limit: u32,
+) -> DbResult<Vec<HistoryEntry>> {
+    manager.history(connection_id.as_deref(), &search, limit)
+}
+
+#[tauri::command]
+fn history_clear(manager: State<'_, Manager>) -> DbResult<()> {
+    manager.history_clear()
+}
+
+/// Open tabs and their text, saved so they survive restarts and crashes.
+#[tauri::command]
+fn session_save(manager: State<'_, Manager>, value: String) -> DbResult<()> {
+    manager.session_save("tabs", &value)
+}
+
+#[tauri::command]
+fn session_load(manager: State<'_, Manager>) -> DbResult<Option<String>> {
+    manager.session_load("tabs")
+}
+
+#[derive(Serialize)]
+struct SqlFile {
+    path: String,
+    text: String,
+}
+
+/// Opens a `.sql` file the user picks.
+#[tauri::command]
+async fn sql_file_open(app: AppHandle) -> Result<Option<SqlFile>> {
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("Open SQL file")
+        .add_filter("SQL", &["sql"])
+        .add_filter("All files", &["*"])
+        .blocking_pick_file()
+        .and_then(|p| p.into_path().ok());
+    let Some(path) = picked else { return Ok(None) };
+    let text = std::fs::read_to_string(&path)?;
+    Ok(Some(SqlFile {
+        path: path.display().to_string(),
+        text,
+    }))
+}
+
+/// Saves a script as a plain `.sql` file; asks where when `path` is not given.
+#[tauri::command]
+async fn sql_file_save(
+    app: AppHandle,
+    path: Option<String>,
+    text: String,
+    name: String,
+) -> Result<Option<String>> {
+    let path = match path {
+        Some(path) => PathBuf::from(path),
+        None => {
+            let picked = app
+                .dialog()
+                .file()
+                .set_title("Save SQL file")
+                .set_file_name(format!("{name}.sql"))
+                .add_filter("SQL", &["sql"])
+                .blocking_save_file()
+                .and_then(|p| p.into_path().ok());
+            match picked {
+                Some(path) => path,
+                None => return Ok(None),
+            }
+        }
+    };
+    std::fs::write(&path, text)?;
+    Ok(Some(path.display().to_string()))
 }
 
 #[tauri::command]
@@ -397,7 +597,9 @@ pub fn run() {
             } else {
                 Secrets::system()
             };
-            app.manage(Manager::new(AppDb::open(dir.join("rowboat.db"))?, secrets));
+            let manager = Manager::new(AppDb::open(dir.join("rowboat.db"))?, secrets);
+            manager.history_prune(&app.state::<SettingsStore>().get());
+            app.manage(manager);
             #[cfg(target_os = "macos")]
             app.set_menu(macos_menu(app.handle())?)?;
             Ok(())
@@ -419,6 +621,18 @@ pub fn run() {
             connection_close,
             query_run,
             query_cancel,
+            query_count,
+            schema_snapshot,
+            export_query,
+            export_page,
+            edits_preview,
+            edits_apply,
+            history_search,
+            history_clear,
+            session_save,
+            session_load,
+            sql_file_open,
+            sql_file_save,
             transaction_end,
             connection_set_auto_commit,
             schema_children,

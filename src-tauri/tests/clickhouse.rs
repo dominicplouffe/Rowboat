@@ -17,7 +17,7 @@ use rowboat_lib::connections::{ConnectionConfig, Tls, TlsMode};
 use rowboat_lib::db::clickhouse::ChSession;
 use rowboat_lib::db::{ConnectParams, DbKind, ErrorKind, ExecOptions, QueryResult, Session};
 
-const ALL: ExecOptions = ExecOptions { row_limit: 0 };
+const ALL: ExecOptions = ExecOptions::limit(0);
 
 fn params() -> ConnectParams {
     ConnectParams {
@@ -93,7 +93,7 @@ async fn row_limit_fetches_one_page_of_an_endless_table() {
     let r = s
         .execute(
             "SELECT number FROM system.numbers",
-            ExecOptions { row_limit: 1000 },
+            ExecOptions::limit(1000),
         )
         .await
         .unwrap();
@@ -111,10 +111,7 @@ async fn row_limit_fetches_one_page_of_an_endless_table() {
 async fn exactly_the_limit_is_not_reported_as_more() {
     let s = connect().await;
     let r = s
-        .execute(
-            "SELECT number FROM numbers(50)",
-            ExecOptions { row_limit: 50 },
-        )
+        .execute("SELECT number FROM numbers(50)", ExecOptions::limit(50))
         .await
         .unwrap();
     assert_eq!(r.rows.len(), 50);
@@ -236,10 +233,7 @@ async fn read_only_connections_refuse_writes_but_still_limit_rows() {
     p.config.read_only = true;
     let s = ChSession::connect(p).await.unwrap();
     let r = s
-        .execute(
-            "SELECT number FROM system.numbers",
-            ExecOptions { row_limit: 10 },
-        )
+        .execute("SELECT number FROM system.numbers", ExecOptions::limit(10))
         .await
         .unwrap();
     assert_eq!(r.rows.len(), 10);

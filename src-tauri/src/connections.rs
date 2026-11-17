@@ -214,6 +214,20 @@ impl AppDb {
                  id       TEXT PRIMARY KEY,
                  position INTEGER NOT NULL,
                  config   TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS history (
+                 id            INTEGER PRIMARY KEY,
+                 connection_id TEXT NOT NULL,
+                 sql           TEXT NOT NULL,
+                 started_at    INTEGER NOT NULL,
+                 elapsed_ms    INTEGER NOT NULL,
+                 rows          INTEGER,
+                 error         TEXT
+             );
+             CREATE INDEX IF NOT EXISTS history_by_connection ON history (connection_id, id DESC);
+             CREATE TABLE IF NOT EXISTS session (
+                 key   TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
              );",
         )
         .map_err(db_err)?;
@@ -280,6 +294,125 @@ impl AppDb {
             .execute("DELETE FROM connections WHERE id = ?1", params![id])
             .map_err(db_err)?;
         Ok(())
+    }
+}
+
+/// One statement that was run, for the History panel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryEntry {
+    pub id: i64,
+    pub connection_id: String,
+    pub sql: String,
+    /// Unix time in milliseconds.
+    pub started_at: i64,
+    pub elapsed_ms: i64,
+    pub rows: Option<i64>,
+    pub error: Option<String>,
+}
+
+impl AppDb {
+    pub fn history_add(
+        &self,
+        connection_id: &str,
+        sql: &str,
+        started_at: i64,
+        elapsed_ms: i64,
+        rows: Option<i64>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.lock()
+            .execute(
+                "INSERT INTO history (connection_id, sql, started_at, elapsed_ms, rows, error)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![connection_id, sql, started_at, elapsed_ms, rows, error],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Newest first. `connection_id` and `search` narrow the list when given;
+    /// every word of `search` must appear in the statement.
+    pub fn history_search(
+        &self,
+        connection_id: Option<&str>,
+        search: &str,
+        limit: u32,
+    ) -> Result<Vec<HistoryEntry>> {
+        let mut sql = String::from(
+            "SELECT id, connection_id, sql, started_at, elapsed_ms, rows, error FROM history WHERE 1 = 1",
+        );
+        let mut values: Vec<String> = Vec::new();
+        if let Some(id) = connection_id {
+            values.push(id.to_string());
+            sql.push_str(&format!(" AND connection_id = ?{}", values.len()));
+        }
+        for word in search.split_whitespace() {
+            // LIKE with its wildcards escaped: the user is searching for text.
+            let escaped = word
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            values.push(format!("%{escaped}%"));
+            sql.push_str(&format!(" AND sql LIKE ?{} ESCAPE '\\'", values.len()));
+        }
+        sql.push_str(&format!(" ORDER BY id DESC LIMIT {}", limit.min(1000)));
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&sql).map_err(db_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                Ok(HistoryEntry {
+                    id: row.get(0)?,
+                    connection_id: row.get(1)?,
+                    sql: row.get(2)?,
+                    started_at: row.get(3)?,
+                    elapsed_ms: row.get(4)?,
+                    rows: row.get(5)?,
+                    error: row.get(6)?,
+                })
+            })
+            .map_err(db_err)?;
+        rows.collect::<std::result::Result<_, _>>().map_err(db_err)
+    }
+
+    pub fn history_clear(&self) -> Result<()> {
+        self.lock()
+            .execute("DELETE FROM history", [])
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Deletes entries older than the retention period.
+    pub fn history_prune(&self, now_ms: i64, retention_days: u32) -> Result<()> {
+        let cutoff = now_ms - i64::from(retention_days) * 86_400_000;
+        self.lock()
+            .execute("DELETE FROM history WHERE started_at < ?1", params![cutoff])
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Stores a named piece of session state (open tabs and their text).
+    pub fn session_save(&self, key: &str, value: &str) -> Result<()> {
+        self.lock()
+            .execute(
+                "INSERT INTO session (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn session_load(&self, key: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        self.lock()
+            .query_row(
+                "SELECT value FROM session WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)
     }
 }
 
@@ -356,6 +489,67 @@ mod tests {
         for needle in ["password", "passphrase", "secret"] {
             assert!(!json.contains(needle), "config must not contain `{needle}`");
         }
+    }
+
+    #[test]
+    fn history_is_newest_first_and_searchable() {
+        let db = AppDb::in_memory().unwrap();
+        db.history_add("a", "select * from orders", 1000, 12, Some(50), None)
+            .unwrap();
+        db.history_add("b", "select * from customers", 2000, 5, Some(3), None)
+            .unwrap();
+        db.history_add(
+            "a",
+            "delete from orders where id = 100%_x",
+            3000,
+            7,
+            None,
+            Some("boom"),
+        )
+        .unwrap();
+
+        let all = db.history_search(None, "", 100).unwrap();
+        assert_eq!(
+            all.iter().map(|h| h.started_at).collect::<Vec<_>>(),
+            [3000, 2000, 1000]
+        );
+        assert_eq!(all[0].error.as_deref(), Some("boom"));
+
+        let only_a = db.history_search(Some("a"), "", 100).unwrap();
+        assert_eq!(only_a.len(), 2);
+        // Every word must match; case does not matter.
+        assert_eq!(
+            db.history_search(None, "ORDERS select", 100).unwrap().len(),
+            1
+        );
+        // % and _ are searched for literally, not as wildcards.
+        assert_eq!(db.history_search(None, "100%_x", 100).unwrap().len(), 1);
+        assert_eq!(db.history_search(None, "%", 100).unwrap().len(), 1);
+        assert_eq!(db.history_search(None, "", 2).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn history_prunes_by_age_and_clears() {
+        let db = AppDb::in_memory().unwrap();
+        let day = 86_400_000;
+        db.history_add("a", "old", 0, 1, None, None).unwrap();
+        db.history_add("a", "recent", 9 * day, 1, None, None)
+            .unwrap();
+        db.history_prune(10 * day, 5).unwrap();
+        let left = db.history_search(None, "", 10).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].sql, "recent");
+        db.history_clear().unwrap();
+        assert!(db.history_search(None, "", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn session_state_is_replaced_not_appended() {
+        let db = AppDb::in_memory().unwrap();
+        assert_eq!(db.session_load("tabs").unwrap(), None);
+        db.session_save("tabs", "[1]").unwrap();
+        db.session_save("tabs", "[1,2]").unwrap();
+        assert_eq!(db.session_load("tabs").unwrap().as_deref(), Some("[1,2]"));
     }
 
     #[test]

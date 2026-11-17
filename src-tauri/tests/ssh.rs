@@ -100,7 +100,7 @@ async fn query_through(tunnel: &Tunnel) -> String {
     let result = session
         .execute(
             "SELECT count(*) FROM generate_series(1, 100000)",
-            ExecOptions { row_limit: 0 },
+            ExecOptions::limit(0),
         )
         .await
         .unwrap();
