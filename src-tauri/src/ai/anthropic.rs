@@ -56,12 +56,15 @@ pub async fn list_models(http: &reqwest::Client, endpoint: &Endpoint) -> AiResul
     Ok(models)
 }
 
-pub fn body(request: &ChatRequest) -> Value {
+/// What every model accepts; used when a model rejects [`MAX_TOKENS`].
+const SMALL_MAX_TOKENS: u32 = 4_096;
+
+pub fn body(request: &ChatRequest, max_tokens: u32) -> Value {
     // No sampling parameters and no `thinking` field: current models reject
     // the former and choose their own thinking depth when the latter is absent.
     json!({
         "model": request.model,
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": max_tokens,
         "stream": true,
         "system": request.system,
         "messages": request.messages,
@@ -75,8 +78,19 @@ pub async fn stream_chat(
     cancel: &Notify,
     on_delta: &mut (dyn FnMut(&str) + Send),
 ) -> AiResult<Usage> {
-    let builder = request(http, endpoint, reqwest::Method::POST, "/v1/messages").json(&body(chat));
-    let response = send(builder, cancel, endpoint.timeout).await?;
+    let post = |max_tokens: u32| {
+        request(http, endpoint, reqwest::Method::POST, "/v1/messages").json(&body(chat, max_tokens))
+    };
+    let mut response = send(post(MAX_TOKENS), cancel, endpoint.timeout).await?;
+    if response.status() == reqwest::StatusCode::BAD_REQUEST {
+        // Older models allow fewer output tokens than we ask for by default.
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !text.contains("max_tokens") {
+            return Err(super::status_error_from(status, &text));
+        }
+        response = send(post(SMALL_MAX_TOKENS), cancel, endpoint.timeout).await?;
+    }
     if !response.status().is_success() {
         return Err(status_error(response).await);
     }

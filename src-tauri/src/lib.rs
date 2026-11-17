@@ -391,8 +391,14 @@ async fn connection_save(
 }
 
 #[tauri::command]
-async fn connection_delete(manager: State<'_, Manager>, id: String) -> DbResult<()> {
-    manager.delete(&id).await
+async fn connection_delete(
+    manager: State<'_, Manager>,
+    copilot: State<'_, Copilot>,
+    id: String,
+) -> DbResult<()> {
+    manager.delete(&id).await?;
+    copilot.forget(&manager, &id);
+    Ok(())
 }
 
 /// Tries a connection without saving it. Returns the server version.

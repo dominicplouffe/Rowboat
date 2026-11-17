@@ -40,6 +40,9 @@
       danger: true,
       prod: connections.list.find((c) => c.name === connectionName)?.environment === 'prod',
     });
+  prompts.schemaChanged = (id) => {
+    if (ai.provider) void ai.reindex(id, true);
+  };
   // Failed statements go to the copilot, which decides whether a fix may be suggested.
   prompts.failed = (tab, statement) => void ai.autoFix(tab, statement);
   // Index a schema as soon as its connection opens, but only once AI is set up.

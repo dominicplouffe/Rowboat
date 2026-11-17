@@ -147,6 +147,15 @@ pub fn endpoint(provider: &AiProvider, manager: &Manager, timeout_secs: u32) -> 
             format!("No API key is saved for {}.", display_name(provider)),
         ));
     }
+    // A key must not cross the network in clear text. Plain http is for
+    // servers on this machine (Ollama, LM Studio), which need no key.
+    if key.is_some() && !encrypted_or_local(&base_url) {
+        return Err(AiError::new(
+            AiErrorKind::NotConfigured,
+            "Rowboat will not send an API key over an unencrypted http:// connection to another machine. \
+             Use an https:// base URL, or remove the key.",
+        ));
+    }
     Ok(Endpoint {
         kind: provider.kind,
         base_url,
@@ -154,6 +163,21 @@ pub fn endpoint(provider: &AiProvider, manager: &Manager, timeout_secs: u32) -> 
         deployment: provider.deployment.clone(),
         timeout: Duration::from_secs(u64::from(timeout_secs)),
     })
+}
+
+fn encrypted_or_local(base_url: &str) -> bool {
+    let Ok(url) = url::Url::parse(base_url) else {
+        return false;
+    };
+    if url.scheme() == "https" {
+        return true;
+    }
+    match url.host() {
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 
 fn display_name(provider: &AiProvider) -> String {
@@ -243,6 +267,12 @@ impl Copilot {
 
     fn indexes(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<SchemaIndex>>> {
         self.indexes.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Drops everything kept about a deleted connection's schema.
+    pub fn forget(&self, manager: &Manager, connection_id: &str) {
+        self.indexes().remove(connection_id);
+        let _ = manager.session_delete(&index_key(connection_id));
     }
 
     pub fn cancel(&self, id: &str) {

@@ -358,8 +358,16 @@ async function fakeDatabase<T>(command: string, args: Record<string, unknown>): 
         stoppedAtMemoryCap: false,
         editable: null,
         elapsedMs: 12,
+        repeatable:
+          /^(select|with|show|explain|values)\b/.test(lower) && !/\breturning\b/.test(lower),
       };
-      if (!/^(select|with|show|explain|values)\b/.test(lower)) {
+      if (options.refetch && !base.repeatable) {
+        throw fail(
+          'other',
+          'This statement changes data, so Rowboat will not run it a second time.',
+        );
+      }
+      if (!/^(select|with|show|explain|values)\b/.test(lower) && !/\breturning\b/.test(lower)) {
         return { ...base, rowsAffected: 1 } as T;
       }
       const limit = options.rowLimit || 5000;

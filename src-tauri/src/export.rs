@@ -44,6 +44,8 @@ pub struct Writer<W: Write + Send> {
     out: W,
     options: Options,
     columns: Vec<Column>,
+    /// JSON object keys: the column names, made unique.
+    keys: Vec<String>,
     rows: u64,
 }
 
@@ -53,6 +55,7 @@ impl<W: Write + Send> Writer<W> {
             out,
             options,
             columns: Vec::new(),
+            keys: Vec::new(),
             rows: 0,
         }
     }
@@ -111,6 +114,25 @@ fn json_value(column: &Column, cell: &Cell) -> serde_json::Value {
     }
 }
 
+/// Column names as JSON object keys. A result can repeat a name
+/// (`SELECT a.id, b.id`); an object cannot, so repeats become `id_2`, `id_3`…
+/// rather than silently overwriting each other.
+fn unique_keys(columns: &[Column]) -> Vec<String> {
+    let mut used = std::collections::HashSet::new();
+    columns
+        .iter()
+        .map(|column| {
+            let mut key = column.name.clone();
+            let mut n = 1;
+            while !used.insert(key.clone()) {
+                n += 1;
+                key = format!("{}_{n}", column.name);
+            }
+            key
+        })
+        .collect()
+}
+
 fn sql_literal(kind: DbKind, column: &Column, cell: &Cell) -> String {
     match cell {
         None => "NULL".into(),
@@ -127,6 +149,7 @@ fn sql_literal(kind: DbKind, column: &Column, cell: &Cell) -> String {
 impl<W: Write + Send> RowSink for Writer<W> {
     fn start(&mut self, columns: &[Column]) -> io::Result<()> {
         self.columns = columns.to_vec();
+        self.keys = unique_keys(columns);
         let names = || columns.iter().map(|c| c.name.as_str());
         match self.options.format {
             Format::Csv => writeln!(
@@ -185,8 +208,9 @@ impl<W: Write + Send> RowSink for Writer<W> {
                 let object: serde_json::Map<String, serde_json::Value> = self
                     .columns
                     .iter()
+                    .zip(&self.keys)
                     .zip(cells)
-                    .map(|(column, cell)| (column.name.clone(), json_value(column, cell)))
+                    .map(|((column, key), cell)| (key.clone(), json_value(column, cell)))
                     .collect();
                 let line = serde_json::to_string(&object).map_err(io::Error::other)?;
                 if self.options.format == Format::Json {
@@ -389,5 +413,31 @@ mod tests {
         );
         assert_eq!(value("1.10"), serde_json::json!("1.10"));
         assert_eq!(value("NaN"), serde_json::json!("NaN"));
+    }
+
+    #[test]
+    fn json_keeps_columns_that_share_a_name() {
+        let column = |name: &str| Column {
+            name: name.into(),
+            type_name: String::new(),
+            kind: ColumnKind::Number,
+        };
+        let mut writer = Writer::new(
+            Vec::new(),
+            Options {
+                format: Format::Ndjson,
+                kind: DbKind::Postgres,
+                table: "t".into(),
+            },
+        );
+        writer
+            .start(&[column("id"), column("id"), column("id_2")])
+            .unwrap();
+        writer
+            .row(&[Some("1".into()), Some("2".into()), Some("3".into())])
+            .unwrap();
+        writer.finish().unwrap();
+        let text = String::from_utf8(writer.into_inner()).unwrap();
+        assert_eq!(text.trim(), r#"{"id":1,"id_2":2,"id_2_2":3}"#);
     }
 }
