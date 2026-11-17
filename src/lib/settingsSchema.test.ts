@@ -39,7 +39,13 @@ describe('settings schema', () => {
   it('every editable setting has a field', () => {
     const covered = new Set(FIELDS.map((f) => `${f.section}.${f.key}`));
     // Edited elsewhere: shortcuts in the Keyboard list, onboarding by the wizard.
-    const exempt = new Set(['keyboard.overrides', 'general.onboardingCompleted']);
+    // Providers have their own editor in the AI section.
+    const exempt = new Set([
+      'keyboard.overrides',
+      'general.onboardingCompleted',
+      'ai.providers',
+      'ai.defaultProvider',
+    ]);
     for (const [section, values] of Object.entries(defaults)) {
       if (typeof values !== 'object') continue;
       for (const key of Object.keys(values)) {
@@ -121,6 +127,10 @@ describe('settings schema', () => {
         'results.binaryDisplay',
         'results.maxCellChars',
         'results.jsonAutoDetect',
+        'ai.autoSuggestFixes',
+        'ai.sendSampleValues',
+        'ai.schemaTokenBudget',
+        'ai.requestTimeoutSecs',
         'privacy.keepHistory',
         'privacy.historyRetentionDays',
       ].sort(),

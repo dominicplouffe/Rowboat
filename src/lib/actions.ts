@@ -1,5 +1,6 @@
 // Every keyboard-reachable action in the app. Shown in Settings → Keyboard.
 
+import { ai } from './ai.svelte';
 import { connections } from './connections.svelte';
 import { dialogs } from './dialogs.svelte';
 import { editorBridge } from './editorBridge';
@@ -102,6 +103,22 @@ export const ACTIONS: Action[] = [
       editorBridge.markError(null);
       void explain(tab, editorBridge.selection());
     },
+  },
+  {
+    id: 'ai.ask',
+    group: 'AI',
+    label: 'Ask AI to write SQL',
+    chord: 'Mod+K',
+    run: () => {
+      if (tabs.active && !tabs.active.generated) void ai.openAsk();
+    },
+  },
+  {
+    id: 'ai.explain',
+    group: 'AI',
+    label: 'Explain SQL in plain English',
+    chord: 'Mod+Shift+K',
+    run: () => void ai.explain(),
   },
   {
     id: 'editor.format',

@@ -23,7 +23,10 @@ Built milestone by milestone (spec → "Milestones"), one branch and one PR each
       editing, JSON viewer, record view, export, history, session restore, formatter, EXPLAIN
   - Cold start measures 0.93–0.99 s on the GPU-less build VM: inside the 1 s budget with no
     headroom. Anything added to the startup path must be lazy.
-- [ ] M3 AI copilot — providers, schema index, fix on error, onboarding wizard
+- [x] **M3 AI copilot** — three provider adapters, schema index, Ask / Fix / Explain, AI settings,
+      first-launch wizard, sample database
+  - No real AI provider has been called: the build environment cannot reach them. The adapters
+    are tested against a local fake server that speaks each documented wire format.
 - [ ] M4 Release — full perf budgets in CI, installers, docs, tag v0.1
 
 ## Commands
@@ -48,7 +51,9 @@ npm run tauri build         # installers for this OS, in src-tauri/target/releas
 npm run budget:bundle       # initial JS < 400 KB gzipped   (after `npm run build`)
 npm run budget:installer    # installers < 20 MB            (after `npm run tauri build`)
 npm run budget:startup      # cold start < 1 s; idle memory < 150 MB on Linux
-                            # (Linux without a display: `xvfb-run -a npm run budget:startup`)
+                            # (Linux without a display: `xvfb-run -a npm run budget:startup`;
+                            #  without a GPU also set WEBKIT_DISABLE_DMABUF_RENDERER=1, or software
+                            #  OpenGL adds >100 MB; `-- --first-launch` measures with the wizard)
 
 npm run icons               # regenerate every icon/brand asset from assets/brand/*.svg
 node scripts/check-version.mjs   # the 4 files that carry the version agree
@@ -76,11 +81,15 @@ src/                     Svelte 5 UI (runes mode). Renders only.
   lib/editing.ts         Staged inline edits → row edits for the core.
   lib/session.ts         Saves and restores open tabs and unsaved text.
   lib/format.ts          SQL formatter (sql-formatter, loaded on first use).
+  lib/ai.svelte.ts       Copilot UI state: Ask panel, suggested fixes, which provider is ready.
+  lib/aiText.ts, diff.ts Comment-as-prompt, streamed-answer parsing; line diff for fixes. Pure.
+  lib/providers.ts       The provider catalogue the forms show (labels, default URLs, key rules).
   editor/sqlEditor.ts    CodeMirror 6. Lazy chunk, loaded after first paint.
   components/            Sidebar, SchemaNodes, TabBar, Workspace, Editor, ResultsPane, Grid,
                          SidePanel (JSON viewer + record view), JsonNode, PlanTree, Menu,
                          RowLimitMenu, StatusBar, SettingsDialog, ConnectionDialog,
-                         ConfirmDialog, HistoryDialog.
+                         ConfirmDialog, HistoryDialog, AskPanel, FixSuggestion, AiContext,
+                         AiProviders, ProviderForm, Onboarding (all AI/wizard UI is lazy).
 src-tauri/
   src/lib.rs             Tauri setup and IPC commands.
   src/manager.rs         Connections + secrets + tunnels + open sessions; what the commands call.
@@ -95,6 +104,13 @@ src-tauri/
                          connections, query history, saved session.
   src/export.rs          CSV / TSV / JSON / NDJSON / SQL INSERT / Markdown writers (RowSink).
   src/edits.rs           Staged edits → UPDATE statements (what Preview SQL shows).
+  src/ai/mod.rs          Provider kinds, HTTP plumbing, errors; dispatch to the three adapters.
+  src/ai/openai_compat.rs, anthropic.rs, gemini.rs   One adapter per API family (SSE streaming).
+  src/ai/sse.rs          Incremental Server-Sent Events parser.
+  src/ai/schema_index.rs Compact schema for prompts: build, fingerprint, rank, token budget.
+  src/ai/copilot.rs      Ask / Fix / Explain: prompt, stream, parse check + one retry, cancel.
+  src/ai/tests.rs        Adapters and copilot against a local fake provider.
+  src/sample.rs          Generates the sample SQLite database the wizard can open.
   src/secrets.rs         OS keychain (keyring); in-memory for the session when there is none.
   src/ssh.rs             SSH tunnels (russh) and known_hosts checking.
   src/tls.rs             rustls setup for the sslmode levels.
@@ -150,8 +166,26 @@ Driver rules: values leave the driver already rendered as text; the row limit
 is enforced while fetching (portal with a row count / `max_result_rows` and a
 client-side cut / stop stepping); cancel must return within a second.
 
-Planned modules (do not create early): `src-tauri/src/ai/` (`openai_compat`,
-`anthropic`, `gemini`, `schema_index.rs`), `history.rs`.
+How an AI request flows: the UI calls `ai_run` with a task (ask / fix /
+explain) and a Tauri channel → `Copilot::run` picks the provider in use, reads
+its key from the keychain, builds the prompt from the connection's schema
+index, and streams the answer back over the channel → generated SQL is parsed
+with sqlparser (one retry with the parser error if it fails) and checked with
+`destructive_reason` → the UI shows it. Accept / Insert only edit the editor
+text. There is no code path from the copilot to `query_run`: keep it that way.
+The first channel event is the exact payload sent ("View context").
+
+Schema index: built from `Session::snapshot` + `Session::details` on connect
+(only once a provider exists), stored in rowboat.db under `schema-index/<id>`
+with a fingerprint; a refresh rewrites it only when the fingerprint changed.
+Sample values are per connection, off by default, PostgreSQL only (from
+`pg_stats`, no table scan). `ConnectionConfig::ai_enabled = false` means
+nothing about that connection is sent. Fix requests are refused in Rust unless
+the error kind is `syntax` or `schema`.
+
+Provider settings (`settings.ai.providers`) hold no secret; the key is saved
+with `ai_key_set` under `ai/<provider id>/key` and never returned. Model lists
+come from each provider's models endpoint; no model name is hard-coded.
 
 ## Non-negotiables
 

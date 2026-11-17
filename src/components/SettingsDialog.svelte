@@ -330,10 +330,29 @@
           {/if}
 
           {#if !searching && section.id === 'ai'}
-            <p class="note muted">
-              Providers, API keys and per-task models arrive with the AI copilot (M3). Keys will be
-              stored in your OS keychain, never in the settings file.
-            </p>
+            {#await import('./AiProviders.svelte') then { default: AiProviders }}
+              <AiProviders />
+            {/await}
+          {/if}
+
+          {#if !searching && section.id === 'general'}
+            <div class="field">
+              <div class="text">
+                <span class="label">First-launch setup</span>
+                <p class="muted">Client ID, AI provider, look and feel, first connection.</p>
+              </div>
+              <div class="control">
+                <button
+                  class="btn"
+                  onclick={() => {
+                    settings.set('general', 'onboardingCompleted', false);
+                    ui.settingsOpen = false;
+                  }}
+                >
+                  Run setup again
+                </button>
+              </div>
+            </div>
           {/if}
 
           {#if !searching && section.id === 'privacy'}

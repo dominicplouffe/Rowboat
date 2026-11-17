@@ -221,10 +221,17 @@ impl SchemaIndex {
             .columns
             .iter()
             .map(|c| {
-                let mut out = format!("{} {}", c.name, c.type_name);
-                if c.nullable {
-                    out.push('?');
-                }
+                // Views and expressions can have no declared type (SQLite).
+                let mut out = if c.type_name.is_empty() {
+                    c.name.clone()
+                } else {
+                    format!(
+                        "{} {}{}",
+                        c.name,
+                        c.type_name,
+                        if c.nullable { "?" } else { "" }
+                    )
+                };
                 if c.pk {
                     out.push_str(" pk");
                 }
@@ -525,6 +532,14 @@ mod tests {
             index.render(&index.tables[2]),
             "view audit.events(at timestamp)"
         );
+    }
+
+    #[test]
+    fn a_column_without_a_declared_type_is_just_its_name() {
+        let (mut snapshot, details) = shop();
+        snapshot.tables[2].columns[0].type_name.clear();
+        let index = build(&snapshot, &details, false, 1);
+        assert_eq!(index.render(&index.tables[2]), "view audit.events(at)");
     }
 
     #[test]

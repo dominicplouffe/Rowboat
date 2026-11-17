@@ -24,7 +24,11 @@ back rows.
 > SQLite (with TLS and SSH tunnels), browse the schema, write SQL with
 > schema-aware autocomplete, run and cancel queries with a fetch-time row limit,
 > page through, sort, filter, edit and export results, and search your query
-> history. The AI copilot comes next. See the full plan in
+> history. The AI copilot writes, fixes and explains SQL using your schema with
+> the provider you choose (OpenAI, Anthropic, Gemini, DeepSeek, Mistral, xAI,
+> OpenRouter, Azure OpenAI, a local Ollama or LM Studio, or any
+> OpenAI-compatible endpoint). It never runs SQL itself and never sends your
+> rows. Installers and a first release come next. See the full plan in
 > [docs/SPEC.md](docs/SPEC.md).
 
 ## Build from source

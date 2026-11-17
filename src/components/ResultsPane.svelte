@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { ai } from '../lib/ai.svelte';
   import { looksLikeJson } from '../lib/cells';
   import { connections } from '../lib/connections.svelte';
   import { dialogs } from '../lib/dialogs.svelte';
@@ -364,6 +365,17 @@
       {#if shown.error.detail}<p class="muted">{shown.error.detail}</p>{/if}
       {#if shown.error.hint}<p class="hint">{shown.error.hint}</p>{/if}
       {#if shown.error.code}<p class="code muted">Code {shown.error.code}</p>{/if}
+      {#if ai.fixable(tab, shown)}
+        {#if shown.fix && shown.fix.status !== 'dismissed'}
+          {#await import('./FixSuggestion.svelte') then { default: FixSuggestion }}
+            <FixSuggestion {tab} statement={shown} />
+          {/await}
+        {:else}
+          <button class="btn" onclick={() => ai.suggestFix(tab, shown)}
+            >Suggest a fix with AI</button
+          >
+        {/if}
+      {/if}
     </div>
   {:else if result}
     {#if result.notices.length > 0}

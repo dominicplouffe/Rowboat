@@ -123,10 +123,12 @@ pub fn endpoint(provider: &AiProvider, manager: &Manager, timeout_secs: u32) -> 
             "This provider needs a base URL.",
         ));
     }
-    if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
+    let valid = url::Url::parse(&base_url)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some());
+    if !valid {
         return Err(AiError::new(
             AiErrorKind::NotConfigured,
-            "The base URL must start with https:// or http://.",
+            "The base URL must be a web address such as https://api.example.com/v1.",
         ));
     }
     if provider.kind == super::ProviderKind::Azure && provider.deployment.is_empty() {

@@ -2,6 +2,7 @@
 
 import { asDbError, ipc } from './ipc';
 import { schemaCache } from './schemaCache.svelte';
+import { settings } from './settings.svelte';
 import type { ConnectionConfig, ConnectionView, DbError, DbKind, SecretInput } from './types';
 
 export const DEFAULT_PORTS: Record<DbKind, number> = {
@@ -39,6 +40,8 @@ export function blankConnection(kind: DbKind = 'postgres'): ConnectionConfig {
     ssh: { enabled: false, host: '', port: 22, user: '', auth: 'agent', keyPath: '' },
     path: '',
     create: false,
+    aiEnabled: true,
+    aiSampleValues: settings.value?.ai.sendSampleValues ?? false,
   };
 }
 
@@ -57,6 +60,8 @@ class Connections {
   errors = $state<Record<string, DbError>>({});
   /** Set by the UI to ask the user about an unknown SSH host key. */
   askHostKey: (prompt: HostKeyPrompt) => Promise<boolean> = async () => false;
+  /** Told when a connection opens; the copilot indexes its schema. */
+  opened: (id: string) => void = () => {};
 
   byId(id: string | null | undefined): ConnectionView | undefined {
     return this.list.find((c) => c.id === id);
@@ -117,6 +122,7 @@ class Connections {
     delete this.errors[id];
     try {
       this.#replace(await this.withHostKeyPrompt((fp) => ipc.connectionOpen(id, fp)));
+      this.opened(id);
       return true;
     } catch (e) {
       this.errors[id] = asDbError(e);

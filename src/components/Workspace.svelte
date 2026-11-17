@@ -129,6 +129,22 @@
           {#if !tab.generated}
             <button
               class="btn ghost"
+              onclick={() => action('ai.ask').run()}
+              title="Describe what you want and get SQL to review ({chord('ai.ask')})"
+            >
+              Ask AI
+            </button>
+            <button
+              class="btn ghost"
+              onclick={() => action('ai.explain').run()}
+              title="Explain the selection or the statement under the cursor in plain English ({chord(
+                'ai.explain',
+              )})"
+            >
+              Explain with AI
+            </button>
+            <button
+              class="btn ghost"
               onclick={() => action('editor.format').run()}
               title="Format SQL ({chord('editor.format')})"
             >

@@ -20,9 +20,12 @@ export interface EditorSelection {
 /** Asks the user to confirm a destructive statement. Set by the UI. */
 export const prompts: {
   confirmDestructive: (sql: string, reason: string, connectionName: string) => Promise<boolean>;
+  /** Told about every failed statement; the copilot may suggest a fix. */
+  failed: (tab: Tab, statement: StatementRun) => void;
 } = {
   // Until the UI installs its dialog, nothing destructive is confirmed.
   confirmDestructive: async () => false,
+  failed: () => {},
 };
 
 /**
@@ -120,6 +123,7 @@ export async function run(tab: Tab, selection: EditorSelection, scope: RunScope)
           statement.error = error;
           statement.status = 'failed';
           if (error.kind === 'connection') await connections.dropDead(connection.id);
+          prompts.failed(tab, statement);
         }
         break;
       }

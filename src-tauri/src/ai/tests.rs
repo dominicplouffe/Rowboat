@@ -724,3 +724,23 @@ async fn the_index_is_stored_and_a_refresh_reports_whether_the_schema_changed() 
         .unwrap();
     assert_eq!(stored.fingerprint, changed.fingerprint);
 }
+
+#[tokio::test]
+async fn a_base_url_that_is_not_a_web_address_is_refused_before_any_request() {
+    let (base, seen) = serve(vec![answer("x")]).await;
+    let mut f = fixture(&base).await;
+    for bad in [
+        "http://",
+        "localhost:11434",
+        "ftp://example.com",
+        "file:///etc/passwd",
+    ] {
+        f.settings.ai.providers[0].base_url = bad.into();
+        let error = Copilot::default()
+            .run(&f.manager, &f.settings, ask(&f, "anything"), &|_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, AiErrorKind::NotConfigured, "{bad}");
+    }
+    assert!(seen.lock().unwrap().is_empty());
+}

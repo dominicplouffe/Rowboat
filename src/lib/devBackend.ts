@@ -2,6 +2,10 @@
 // tests. Never part of a production bundle (see ipc.ts).
 
 import type {
+  AiEvent,
+  AiOutcome,
+  AiProvider,
+  AiRequest,
   AppInfo,
   ConnectionConfig,
   ConnectionView,
@@ -67,6 +71,8 @@ export function defaultSettings(): Settings {
       sshKnownHosts: 'ask',
     },
     ai: {
+      providers: [],
+      defaultProvider: '',
       autoSuggestFixes: true,
       sendSampleValues: false,
       schemaTokenBudget: 4000,
@@ -386,7 +392,154 @@ async function fakeDatabase<T>(command: string, args: Record<string, unknown>): 
             },
       } as T;
     }
+    case 'ai_key_set':
+      if (args.key) aiKeys.add(args.providerId as string);
+      else aiKeys.delete(args.providerId as string);
+      return undefined as T;
+    case 'ai_key_status':
+      return Object.fromEntries(current.ai.providers.map((p) => [p.id, aiKeys.has(p.id)])) as T;
+    case 'ai_models': {
+      const provider = args.provider as AiProvider;
+      requireKey(provider);
+      return [`${provider.kind}-large`, `${provider.kind}-small`] as T;
+    }
+    case 'ai_test':
+      requireKey(args.provider as AiProvider);
+      return 'OK' as T;
+    case 'ai_cancel':
+      cancelled.add(args.id as string);
+      return undefined as T;
+    case 'ai_index':
+      return {
+        tables: 2,
+        columns: 6,
+        builtAt: Date.now(),
+        fingerprint: 'fake',
+        changed: Boolean(args.refresh),
+        withSamples: false,
+      } as T;
+    case 'sample_database': {
+      const existing = [...connections.values()].find((c) => c.name === 'Sample shop');
+      if (existing) return view(existing) as T;
+      const config: ConnectionConfig = {
+        id: `fake-${nextId++}`,
+        name: 'Sample shop',
+        kind: 'sqlite',
+        folder: '',
+        color: '',
+        environment: 'none',
+        readOnly: false,
+        host: '',
+        port: 0,
+        database: '',
+        user: '',
+        usePgpass: false,
+        tls: { mode: 'disable', caCertPath: '', clientCertPath: '', clientKeyPath: '' },
+        ssh: { enabled: false, host: '', port: 22, user: '', auth: 'agent', keyPath: '' },
+        path: '(in memory)/sample.db',
+        create: false,
+        aiEnabled: true,
+        aiSampleValues: false,
+      };
+      connections.set(config.id, config);
+      return view(config) as T;
+    }
+    case 'ai_run':
+      return fakeCopilot(
+        args.request as AiRequest,
+        args.onEvent as (event: AiEvent) => void,
+      ) as Promise<T>;
     default:
       throw new Error(`unknown command: ${command}`);
   }
+}
+
+// ---- A pretend AI provider ----
+
+const aiKeys = new Set<string>();
+
+function aiFail(kind: string, message: string): { kind: string; message: string } {
+  return { kind, message };
+}
+
+function requireKey(provider: AiProvider): void {
+  if (!['local', 'custom'].includes(provider.kind) && !aiKeys.has(provider.id)) {
+    throw aiFail('not-configured', `No API key is saved for ${provider.name || provider.kind}.`);
+  }
+}
+
+async function fakeCopilot(
+  request: AiRequest,
+  onEvent: (event: AiEvent) => void,
+): Promise<AiOutcome> {
+  const provider = current.ai.providers.find((p) => p.id === current.ai.defaultProvider);
+  if (!provider) {
+    throw aiFail('not-configured', 'No AI provider is set up. Add one in Settings → AI.');
+  }
+  requireKey(provider);
+  const connection = request.connectionId ? connections.get(request.connectionId) : undefined;
+  if (connection && connection.aiEnabled === false) {
+    throw aiFail('not-configured', `AI is turned off for the connection "${connection.name}".`);
+  }
+  if (request.task === 'fix' && !['syntax', 'schema'].includes(request.errorKind ?? '')) {
+    throw aiFail('other', 'Only syntax and schema errors are sent to the AI.');
+  }
+  const model =
+    request.task === 'fix' && provider.fixModel ? provider.fixModel : provider.model || 'fake';
+  const user =
+    request.task === 'fix'
+      ? `This statement failed:\n${request.sql}\n\nThe database said:\n${request.error}`
+      : request.task === 'explain'
+        ? (request.sql ?? '')
+        : (request.prompt ?? '');
+  onEvent({
+    type: 'context',
+    provider: provider.name || provider.kind,
+    request: {
+      model,
+      system:
+        'You are the SQL copilot inside Rowboat.\n\n<schema>\ncustomers(id int pk, name text)\norders(id int pk, customer_id int fk→customers.id, total numeric, created_at timestamptz)\n</schema>',
+      messages: [{ role: 'user', content: user }],
+    },
+    tablesSent: 2,
+    tablesTotal: 2,
+  });
+
+  const prompt = (request.prompt ?? '').toLowerCase();
+  let sql: string | null = null;
+  let explanation: string;
+  if (request.task === 'explain') {
+    explanation = 'Returns every row of the query, newest first. Nothing is changed.';
+  } else if (request.task === 'fix') {
+    sql = (request.sql ?? '').replace(/fromm/gi, 'FROM');
+    explanation = 'FROM was misspelled.';
+  } else if (prompt.includes('delete')) {
+    sql = 'DELETE FROM orders\nWHERE total = 0;';
+    explanation = 'Removes orders with a zero total.';
+  } else if (prompt.includes('nothing')) {
+    explanation = 'There is no table for that in this schema.';
+  } else {
+    sql =
+      'SELECT c.name, sum(o.total) AS revenue\nFROM orders o\nJOIN customers c ON c.id = o.customer_id\nGROUP BY c.name\nORDER BY revenue DESC;';
+    explanation = 'Total order value per customer, highest first.';
+  }
+  const text = sql ? `\`\`\`sql\n${sql}\n\`\`\`\n${explanation}` : explanation;
+  // Stream in a few pieces so the UI's streaming path is exercised.
+  const slow = prompt.includes('slow');
+  for (let i = 0; i < text.length; i += 24) {
+    if (cancelled.delete(request.id)) throw aiFail('cancelled', 'Cancelled.');
+    await new Promise((r) => setTimeout(r, slow ? 150 : 1));
+    onEvent({ type: 'delta', text: text.slice(i, i + 24) });
+  }
+  if (cancelled.delete(request.id)) throw aiFail('cancelled', 'Cancelled.');
+  return {
+    text,
+    sql,
+    explanation,
+    destructive: sql?.startsWith('DELETE') ? 'DELETE removes rows.' : null,
+    parseError: null,
+    usage: { inputTokens: 180, outputTokens: 42 },
+    provider: provider.name || provider.kind,
+    model,
+  };
 }

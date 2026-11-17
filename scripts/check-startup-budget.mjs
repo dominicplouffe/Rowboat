@@ -1,6 +1,11 @@
 // Enforces the cold-start budget (and, on Linux, the idle-memory budget).
 //
-//   node scripts/check-startup-budget.mjs [path/to/rowboat]
+//   node scripts/check-startup-budget.mjs [path/to/rowboat] [--first-launch]
+//
+// By default this measures an everyday launch (setup already done). With
+// `--first-launch` the settings folder starts empty, so the setup wizard shows.
+// On a machine without a GPU, set WEBKIT_DISABLE_DMABUF_RENDERER=1: otherwise
+// WebKitGTK falls back to software OpenGL, which alone adds over 100 MB.
 //
 // The app is launched several times with ROWBOAT_BENCH_OUT set. In that mode
 // it writes the time from process start to the first painted, usable window to
@@ -23,7 +28,15 @@
 // for information.
 
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -51,13 +64,15 @@ function findBinary() {
   }
   return candidates.find(existsSync) ?? candidates[0];
 }
-const binary = process.argv[2] ?? findBinary();
+const binary = process.argv.slice(2).find((arg) => !arg.startsWith('--')) ?? findBinary();
 const RUNS = Number(process.env.STARTUP_RUNS ?? 5);
 const STARTUP_BUDGET_MS = Number(process.env.STARTUP_BUDGET_MS ?? 1000);
 const MEMORY_BUDGET_MB = Number(
   process.env.IDLE_MEMORY_BUDGET_MB ?? (process.platform === 'win32' ? 200 : 150),
 );
 const IDLE_MS = 4000;
+// `--first-launch` measures the very first run, with the setup wizard showing.
+const FIRST_LAUNCH = process.argv.includes('--first-launch');
 const TIMEOUT_MS = 60_000;
 
 if (!existsSync(binary)) {
@@ -105,6 +120,15 @@ function treeMemoryMb(rootPid) {
 function launch(index, { sampleMemory }) {
   return new Promise((resolve, reject) => {
     const out = join(work, `run-${index}.json`);
+    const config = join(work, `config-${index}`);
+    mkdirSync(config, { recursive: true });
+    if (!FIRST_LAUNCH) {
+      // An everyday launch: setup was done on a previous run.
+      writeFileSync(
+        join(config, 'settings.json'),
+        JSON.stringify({ version: 1, general: { onboardingCompleted: true } }),
+      );
+    }
     const child = spawn(binary, [], {
       stdio: 'ignore',
       env: {
@@ -113,9 +137,9 @@ function launch(index, { sampleMemory }) {
         // The clock starts here, before the process exists.
         ROWBOAT_BENCH_T0: String(Date.now()),
         ROWBOAT_BENCH_IDLE_MS: sampleMemory ? String(IDLE_MS) : '0',
-        // Fresh settings every run: a true first launch, and nothing of the
-        // developer's own config is touched.
-        ROWBOAT_CONFIG_DIR: join(work, `config-${index}`),
+        // Its own settings folder every run: nothing of the developer's own
+        // config is touched.
+        ROWBOAT_CONFIG_DIR: config,
       },
     });
     let memory = null;
