@@ -199,7 +199,7 @@ async fn cancel_stops_a_long_query_within_a_second() {
     let task = tokio::spawn(async move {
         runner
             .execute(
-                "SELECT count() FROM system.numbers WHERE NOT ignore(sleepEachRow(0.001))",
+                "SELECT sleepEachRow(1) FROM numbers(60) SETTINGS max_block_size = 1",
                 ALL,
             )
             .await
