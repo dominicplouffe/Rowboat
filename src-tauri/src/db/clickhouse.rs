@@ -13,7 +13,7 @@
 //! the settings above; the driver notices the refusal once and from then on
 //! sends none, relying on the client-side cut for the row limit.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -52,8 +52,10 @@ pub struct ChSession {
     session_id: Option<String>,
     version: String,
     settings_level: AtomicU8,
-    /// True once a request in the session has succeeded with `database` set.
-    session_has_database: AtomicBool,
+    /// The database statements run in: the connection's own until the user
+    /// runs `USE other`. Sent with every request, because a ClickHouse HTTP
+    /// session does not remember the `database` parameter of earlier requests.
+    current_database: Mutex<String>,
     /// Serializes user statements: a ClickHouse HTTP session allows one at a time.
     gate: tokio::sync::Mutex<()>,
     running: Mutex<Option<String>>,
@@ -215,7 +217,7 @@ impl ChSession {
             session_id: (!c.read_only).then(|| format!("rowboat-{}", uuid::Uuid::new_v4())),
             version: String::new(),
             settings_level: AtomicU8::new(SETTINGS_ALL),
-            session_has_database: AtomicBool::new(false),
+            current_database: Mutex::new(c.database.clone()),
             gate: tokio::sync::Mutex::new(()),
             running: Mutex::new(None),
             cancelled: Notify::new(),
@@ -249,13 +251,18 @@ impl ChSession {
         {
             let mut query = url.query_pairs_mut();
             query.append_pair("query_id", query_id);
-            // In a session the database is set once; sending it every time
-            // would undo the user's own `USE other_db`.
-            let in_session = stateful && self.session_id.is_some();
-            if !self.database.is_empty()
-                && !(in_session && self.session_has_database.load(Ordering::SeqCst))
-            {
-                query.append_pair("database", &self.database);
+            // User statements run in the database they last chose with `USE`;
+            // the navigator's own queries always name theirs.
+            let database = if stateful {
+                self.current_database
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            } else {
+                self.database.clone()
+            };
+            if !database.is_empty() {
+                query.append_pair("database", &database);
             }
             if stateful {
                 if let Some(session) = &self.session_id {
@@ -274,16 +281,24 @@ impl ChSession {
                 query.append_pair("enable_http_compression", "1");
                 query.append_pair("output_format_binary_write_json_as_string", "1");
                 query.append_pair("log_comment", &self.client_id);
+                // The default output format; a FORMAT clause in the SQL wins.
+                query.append_pair("default_format", FORMAT);
             }
         }
-        self.http
+        let request = self
+            .http
             .post(url)
             // Basic auth is base64, so any UTF-8 user name or password works
             // (raw header values cannot carry non-ASCII text).
-            .basic_auth(&self.user, Some(&self.password))
-            // The default output format; a FORMAT clause in the SQL still wins.
-            .header("X-ClickHouse-Format", FORMAT)
-            .body(sql.to_string())
+            .basic_auth(&self.user, Some(&self.password));
+        // A user who may not change settings cannot set `default_format`
+        // either; the header asks for the same thing without being a setting.
+        let request = if level == SETTINGS_ALL {
+            request
+        } else {
+            request.header("X-ClickHouse-Format", FORMAT)
+        };
+        request.body(sql.to_string())
     }
 
     /// Sends a statement and decodes the response, stepping down the settings
@@ -300,8 +315,11 @@ impl ChSession {
             let level = self.settings_level.load(Ordering::SeqCst);
             match self.run_once(sql, query_id, options, level, stateful).await {
                 Ok(result) => {
-                    if stateful {
-                        self.session_has_database.store(true, Ordering::SeqCst);
+                    if let (true, Some(database)) = (stateful, used_database(sql)) {
+                        *self
+                            .current_database
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = database;
                     }
                     return Ok(result);
                 }
@@ -459,6 +477,22 @@ impl ChSession {
         let id = uuid::Uuid::new_v4().to_string();
         self.run(sql, &id, ExecOptions::limit(0), false).await
     }
+}
+
+/// The database a `USE db` statement switches to.
+fn used_database(sql: &str) -> Option<String> {
+    let statement = sql.trim().trim_end_matches(';').trim();
+    let (verb, name) = statement.split_once(char::is_whitespace)?;
+    if !verb.eq_ignore_ascii_case("use") {
+        return None;
+    }
+    let name = name.trim();
+    let name = name
+        .strip_prefix('`')
+        .and_then(|n| n.strip_suffix('`'))
+        .or_else(|| name.strip_prefix('"').and_then(|n| n.strip_suffix('"')))
+        .unwrap_or(name);
+    (!name.is_empty() && !name.contains(char::is_whitespace)).then(|| name.to_string())
 }
 
 fn lit(value: &str) -> String {
@@ -1129,7 +1163,7 @@ mod tests {
         ); // reader:s3cret
         assert!(!request.params.values().any(|v| v.contains("s3cret")));
         // Binary rows, compression, and the fetch-time row limit.
-        assert_eq!(request.headers["x-clickhouse-format"], FORMAT);
+        assert_eq!(request.params["default_format"], FORMAT);
         assert_eq!(request.params["enable_http_compression"], "1");
         assert!(request.headers["accept-encoding"].contains("gzip"));
         assert_eq!(request.params["max_result_rows"], "1000");
@@ -1157,26 +1191,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_database_is_set_once_so_use_keeps_working() {
+    async fn statements_run_in_the_connection_database_until_use_changes_it() {
         let server = serve(|_| Reply::Rows(numbers(1))).await;
         let session = ChSession::connect(params(server.port)).await.unwrap();
         let all = ExecOptions::limit(0);
         session.execute("SELECT 1", all).await.unwrap();
-        session.execute("USE other_db", all).await.unwrap();
         session.execute("SELECT 2", all).await.unwrap();
+        session.execute("USE `other_db`;", all).await.unwrap();
+        session.execute("SELECT 3", all).await.unwrap();
 
         let queries = server.user_queries();
+        let database = |i: usize| queries[i].params.get("database").map(String::as_str);
+        // Every statement names its database: the server does not remember it.
+        assert_eq!(database(0), Some("analytics"));
+        assert_eq!(database(1), Some("analytics"));
+        // After USE, later statements follow the user's choice.
+        assert_eq!(database(3), Some("other_db"));
         assert_eq!(
-            queries[0].params.get("database").map(String::as_str),
-            Some("analytics")
-        );
-        // Later statements in the session must not reset the database.
-        assert!(!queries[1].params.contains_key("database"));
-        assert!(!queries[2].params.contains_key("database"));
-        assert_eq!(
-            queries[2].params["session_id"],
+            queries[3].params["session_id"],
             queries[0].params["session_id"]
         );
+    }
+
+    #[test]
+    fn use_statements_are_recognised() {
+        assert_eq!(used_database("USE sales").as_deref(), Some("sales"));
+        assert_eq!(used_database("  use `my db2`; ").as_deref(), None);
+        assert_eq!(used_database("use \"Sales\";").as_deref(), Some("Sales"));
+        assert_eq!(used_database("SELECT 'use x'"), None);
+        assert_eq!(used_database("USE"), None);
     }
 
     #[tokio::test]
