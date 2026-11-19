@@ -11,14 +11,12 @@ The product spec is `docs/SPEC.md`. Read it before changing behavior. Its
 Built milestone by milestone (spec → "Milestones"), one branch and one PR each.
 
 - [x] **M0 Foundation** — app scaffold, settings store, brand assets, CI + release workflows
-  - The workflows are staged in `.github/workflows.pending/` until someone with
-    the GitHub `workflow` permission moves them to `.github/workflows/` (see the
-    README there). Until then CI has never run: macOS and Windows builds are
-    unverified.
+  - CI is active and green on macOS, Windows and Linux. Every green push to main
+    replaces the rolling `latest-build` pre-release with that commit's unsigned
+    installers.
 - [x] **M1 Connections** — three drivers, TLS, SSH tunnels, keychain secrets, run and cancel,
       schema navigator, Prod guard
-  - ClickHouse has only been tested against a fake server and hand-encoded bytes;
-    `tests/clickhouse.rs` has never run against a real one.
+  - `tests/clickhouse.rs` runs against a real ClickHouse in CI's integration job.
 - [x] **M2 Editor** — schema-aware autocomplete, paging, grid sort/filter/resize/hide, inline
       editing, JSON viewer, record view, export, history, session restore, formatter, EXPLAIN
   - Cold start measures 0.93–0.99 s on the GPU-less build VM: inside the 1 s budget with no
@@ -29,8 +27,7 @@ Built milestone by milestone (spec → "Milestones"), one branch and one PR each
     are tested against a local fake server that speaks each documented wire format.
 - [x] **M4 Release** — update notice, grid budget test, user guide, signing and release docs,
       acceptance status
-  - **v0.1 is not tagged.** The release gate is "every CI budget green" and CI has never run.
-    What is left is in `docs/RELEASING.md`; where each acceptance criterion stands is in
+  - **v0.1 is not tagged.** The release gate is "every CI budget green". What is left is in `docs/RELEASING.md`; where each acceptance criterion stands is in
     `docs/ACCEPTANCE.md`. Keep both current.
 
 ## Commands
