@@ -2,37 +2,16 @@
 
 ## Before the first release
 
-These are open as of the v0.1 work. None can be done from the development
-session that wrote the code.
+CI is active and green on macOS, Windows and Linux. Every green push to main
+replaces the rolling `latest-build` pre-release with that commit's unsigned
+installers; it is not a versioned release, and the app's update check ignores
+it. These are still open:
 
-1. **Activate the workflows.** They are complete but sit in
-   `.github/workflows.pending/` because the session that pushed them was not
-   allowed to create workflow files. From a clone where you can push workflows:
-
-   ```bash
-   git rm .github/workflows.pending/README.md
-   ```
-
-   ```bash
-   git mv .github/workflows.pending .github/workflows
-   ```
-
-   ```bash
-   git commit -m "Activate CI and release workflows"
-   ```
-
-   ```bash
-   git push
-   ```
-
-2. **Get CI green.** It has never run. The Linux jobs match what was run by
-   hand during development. The macOS and Windows jobs have never built, so
-   expect first-run fixes there (most likely in packaging, or in tests that
-   assume a Unix path). The ClickHouse integration tests have also never run
-   against a real server.
-3. **Check the startup numbers on real hardware.** CI holds hosted runners to a
-   looser cold-start number (2.5 s, 4 s on Windows) because they are slow VMs
-   without a GPU. The spec's 1 s target is for a 2021+ laptop:
+1. **Check the startup numbers on real hardware.** CI holds hosted runners to a
+   looser cold-start number (5 s on macOS, 4 s on Windows, 2.5 s on Linux)
+   because they are shared VMs without a GPU. The spec's 1 s target is for a
+   2021+ laptop. Done on macOS (0.48 s on an M1 Pro); Windows and Linux on
+   real hardware are still to do:
 
    ```bash
    npm run tauri build
@@ -42,10 +21,10 @@ session that wrote the code.
    npm run budget:startup
    ```
 
-4. **Try the copilot with real providers.** The acceptance criteria name
+2. **Try the copilot with real providers.** The acceptance criteria name
    OpenAI, Anthropic, Gemini, DeepSeek and Ollama. Development could only test
    against a fake server speaking each documented format.
-5. **Walk through [ACCEPTANCE.md](ACCEPTANCE.md)** on macOS, Windows and
+3. **Walk through [ACCEPTANCE.md](ACCEPTANCE.md)** on macOS, Windows and
    Ubuntu.
 
 ## Cutting a release

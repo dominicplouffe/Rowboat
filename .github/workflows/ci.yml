@@ -102,7 +102,8 @@ jobs:
             os: macos-latest
             rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
             args: --target universal-apple-darwin
-            startup-budget-ms: 2500
+            # Hosted macOS runners measure 1.5 to 4.8 s for the same build.
+            startup-budget-ms: 5000
           - name: Windows
             os: windows-latest
             rust-targets: ''
@@ -180,3 +181,38 @@ jobs:
           name: rowboat-arch
           retention-days: 14
           path: arch-out/
+
+  # Every green push to main replaces one rolling pre-release, "latest-build",
+  # with the installers built above, so there is always something to download.
+  # It is not a versioned release: those come from release.yml when a v* tag
+  # is pushed. The app's update check ignores it (the tag is not a version).
+  publish:
+    name: Publish latest build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [lint, test, integration, build, arch]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: rowboat-*
+          path: artifacts
+      - name: Replace the latest-build pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mapfile -t files < <(find artifacts -type f \( -name '*.dmg' -o -name '*.msi' \
+            -o -name '*.exe' -o -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) | sort)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No installers were found in the build artifacts." >&2
+            exit 1
+          fi
+          printf 'Publishing %s\n' "${files[@]}"
+          gh release delete latest-build --yes --cleanup-tag || true
+          gh release create latest-build "${files[@]}" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Latest build (${GITHUB_SHA::7})" \
+            --notes "Unsigned installers built from main at $GITHUB_SHA. Every test and budget passed for this commit. This is a rolling build, replaced on each push; it is not a versioned release."
