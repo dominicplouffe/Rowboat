@@ -253,7 +253,7 @@ fn ai_key_status(
         .ai
         .providers
         .iter()
-        .map(|p| (p.id.clone(), matches!(manager.ai_key(&p.id), Ok(Some(_)))))
+        .map(|p| (p.id.clone(), manager.has_ai_key(&p.id)))
         .collect()
 }
 

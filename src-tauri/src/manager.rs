@@ -134,9 +134,9 @@ impl Manager {
     async fn view(&self, config: ConnectionConfig) -> ConnectionView {
         let open = self.sessions.lock().await.get(&config.id).cloned();
         ConnectionView {
-            has_password: self.secrets.has(&config.id, SecretKind::Password),
-            has_ssh_password: self.secrets.has(&config.id, SecretKind::SshPassword),
-            has_ssh_passphrase: self.secrets.has(&config.id, SecretKind::SshPassphrase),
+            has_password: self.has_connection_secret(&config.id, SecretKind::Password),
+            has_ssh_password: self.has_connection_secret(&config.id, SecretKind::SshPassword),
+            has_ssh_passphrase: self.has_connection_secret(&config.id, SecretKind::SshPassphrase),
             connected: open.is_some(),
             server_version: open.as_ref().map(|o| o.session.server_version()),
             supports_transactions: open
@@ -168,12 +168,19 @@ impl Manager {
         let existed = !config.id.is_empty();
         let config = self.db.save(config).map_err(internal)?;
         for kind in SecretKind::ALL {
-            if let Some(value) = secrets.get(kind) {
-                self.secrets.set(&config.id, kind, value).map_err(|e| {
-                    DbError::other(format!(
-                        "Could not store the secret in the system keychain: {e}"
-                    ))
-                })?;
+            let account = Secrets::account(&config.id, kind);
+            match secrets.get(kind) {
+                Some(value) => {
+                    self.secrets.set(&config.id, kind, value).map_err(|e| {
+                        DbError::other(format!(
+                            "Could not store the secret in the system keychain: {e}"
+                        ))
+                    })?;
+                    self.remember_secret(&account, !value.is_empty());
+                }
+                // A connection saved for the first time has nothing stored yet.
+                None if !existed => self.remember_secret(&account, false),
+                None => {}
             }
         }
         // An edited connection must be reopened to pick the changes up.
@@ -186,6 +193,9 @@ impl Manager {
     pub async fn delete(&self, id: &str) -> DbResult<()> {
         self.close(id).await;
         self.secrets.forget(id);
+        for kind in SecretKind::ALL {
+            let _ = self.db.forget_secret_presence(&Secrets::account(id, kind));
+        }
         self.db.delete(id).map_err(internal)
     }
 
@@ -194,9 +204,54 @@ impl Manager {
         match typed.get(kind) {
             Some(value) => Ok(Some(value.clone()).filter(|v| !v.is_empty())),
             None if id.is_empty() => Ok(None),
-            None => self.secrets.get(id, kind).map_err(|e| {
-                DbError::other(format!("Could not read from the system keychain: {e}"))
-            }),
+            None => {
+                let stored = self.secrets.get(id, kind).map_err(|e| {
+                    DbError::other(format!("Could not read from the system keychain: {e}"))
+                })?;
+                self.remember_secret(&Secrets::account(id, kind), stored.is_some());
+                Ok(stored)
+            }
+        }
+    }
+
+    /// Whether a secret is stored, asking the keychain at most once per entry.
+    /// macOS asks the user before an app reads a keychain item, so reading
+    /// every secret to draw the connection list meant one password prompt per
+    /// secret at launch. The answer is kept in rowboat.db, which records only
+    /// whether an entry exists. Connecting still reads the keychain itself.
+    fn has_secret(
+        &self,
+        account: &str,
+        read: impl FnOnce() -> Result<Option<String>, String>,
+    ) -> bool {
+        if !self.secrets.is_persistent() {
+            // Secrets last for this run only, in memory: nothing to remember.
+            return matches!(read(), Ok(Some(_)));
+        }
+        if let Ok(Some(present)) = self.db.secret_presence(account) {
+            return present;
+        }
+        // Stored before Rowboat kept track: look once and remember. A read
+        // the user refused is not remembered, so it is asked again next time.
+        match read() {
+            Ok(stored) => {
+                self.remember_secret(account, stored.is_some());
+                stored.is_some()
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn has_connection_secret(&self, id: &str, kind: SecretKind) -> bool {
+        self.has_secret(&Secrets::account(id, kind), || self.secrets.get(id, kind))
+    }
+
+    fn remember_secret(&self, account: &str, present: bool) {
+        // Without a keychain the secret is gone after quitting; a record of it
+        // would outlive it.
+        if self.secrets.is_persistent() {
+            // Only a hint for the UI; losing it costs one keychain read later.
+            let _ = self.db.set_secret_presence(account, present);
         }
     }
 
@@ -657,11 +712,22 @@ impl Manager {
     // ------------------------------------------------------------------ AI --
 
     pub fn ai_key(&self, provider_id: &str) -> Result<Option<String>, String> {
-        self.secrets.ai_key(provider_id)
+        let key = self.secrets.ai_key(provider_id)?;
+        self.remember_secret(&Secrets::ai_account(provider_id), key.is_some());
+        Ok(key)
+    }
+
+    /// Whether a provider's API key is saved, without reading it (see `has_secret`).
+    pub fn has_ai_key(&self, provider_id: &str) -> bool {
+        self.has_secret(&Secrets::ai_account(provider_id), || {
+            self.secrets.ai_key(provider_id)
+        })
     }
 
     pub fn set_ai_key(&self, provider_id: &str, key: &str) -> Result<(), String> {
-        self.secrets.set_ai_key(provider_id, key)
+        self.secrets.set_ai_key(provider_id, key)?;
+        self.remember_secret(&Secrets::ai_account(provider_id), !key.is_empty());
+        Ok(())
     }
 
     pub fn config(&self, connection_id: &str) -> DbResult<ConnectionConfig> {
@@ -786,6 +852,7 @@ fn internal(error: crate::error::Error) -> DbError {
 mod tests {
     use super::*;
     use crate::connections::Environment;
+    use crate::secrets::Backend;
 
     fn manager() -> Manager {
         Manager::new(AppDb::in_memory().unwrap(), Secrets::in_memory())
@@ -857,6 +924,112 @@ mod tests {
             .await
             .unwrap();
         assert!(!cleared.has_password);
+    }
+
+    /// A keychain that counts reads: on macOS each read of a stored entry
+    /// can put a password prompt in front of the user.
+    #[derive(Default, Clone)]
+    struct CountingKeychain {
+        inner: Arc<crate::secrets::Memory>,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Backend for CountingKeychain {
+        fn get(&self, account: &str) -> Result<Option<String>, String> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(account)
+        }
+        fn set(&self, account: &str, secret: &str) -> Result<(), String> {
+            self.inner.set(account, secret)
+        }
+        fn delete(&self, account: &str) -> Result<(), String> {
+            self.inner.delete(account)
+        }
+    }
+
+    impl CountingKeychain {
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    fn manager_on(keychain: &CountingKeychain, db: AppDb) -> Manager {
+        Manager::new(db, Secrets::with_backend(Box::new(keychain.clone())))
+    }
+
+    #[tokio::test]
+    async fn listing_connections_does_not_read_the_keychain() {
+        let keychain = CountingKeychain::default();
+        let m = manager_on(&keychain, AppDb::in_memory().unwrap());
+        let saved = m
+            .save(
+                ConnectionConfig {
+                    name: "pg".into(),
+                    ..Default::default()
+                },
+                SecretInput {
+                    password: Some("pw".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let listed = m.list().await.unwrap();
+        assert!(listed[0].has_password && !listed[0].has_ssh_password);
+        let cleared = m
+            .save(
+                saved.config.clone(),
+                SecretInput {
+                    password: Some(String::new()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!cleared.has_password);
+        assert_eq!(keychain.reads(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_secret_saved_by_an_older_version_is_looked_up_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rowboat.db");
+        let keychain = CountingKeychain::default();
+        // An older version saved the connection and its password but kept no
+        // record of which secrets exist.
+        let config = AppDb::open(path.clone())
+            .unwrap()
+            .save(ConnectionConfig {
+                name: "pg".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        keychain
+            .inner
+            .set(&Secrets::account(&config.id, SecretKind::Password), "pw")
+            .unwrap();
+
+        let m = manager_on(&keychain, AppDb::open(path.clone()).unwrap());
+        assert!(m.list().await.unwrap()[0].has_password);
+        let first = keychain.reads();
+        assert_eq!(first, SecretKind::ALL.len());
+        assert!(m.list().await.unwrap()[0].has_password);
+        drop(m);
+        // The answer survives a restart.
+        let m = manager_on(&keychain, AppDb::open(path).unwrap());
+        assert!(m.list().await.unwrap()[0].has_password);
+        assert_eq!(keychain.reads(), first);
+    }
+
+    #[test]
+    fn checking_for_an_ai_key_does_not_read_it() {
+        let keychain = CountingKeychain::default();
+        let m = manager_on(&keychain, AppDb::in_memory().unwrap());
+        m.set_ai_key("p1", "sk-test").unwrap();
+        assert!(m.has_ai_key("p1"));
+        m.set_ai_key("p1", "").unwrap();
+        assert!(!m.has_ai_key("p1"));
+        assert_eq!(keychain.reads(), 0);
     }
 
     #[tokio::test]
