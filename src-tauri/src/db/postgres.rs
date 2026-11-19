@@ -52,6 +52,8 @@ struct Shared {
     in_transaction: AtomicBool,
     cancel: Mutex<Option<(CancelToken, Option<MakeRustlsConnect>)>>,
     notices: Mutex<Vec<String>>,
+    /// The tasks that own the socket, so the connection can be dropped at once.
+    tasks: Mutex<Vec<tokio::task::AbortHandle>>,
 }
 
 impl Shared {
@@ -61,6 +63,7 @@ impl Shared {
             in_transaction: AtomicBool::new(false),
             cancel: Mutex::new(None),
             notices: Mutex::new(Vec::new()),
+            tasks: Mutex::new(Vec::new()),
         })
     }
 
@@ -225,7 +228,8 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
+    let tasks = shared.clone();
+    let driver = tokio::spawn(async move {
         let mut messages = futures_util::stream::poll_fn(move |cx| connection.poll_message(cx));
         while let Some(message) = messages.next().await {
             match message {
@@ -240,6 +244,11 @@ where
             }
         }
     });
+    tasks
+        .tasks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(driver.abort_handle());
 }
 
 async fn connect_with<T>(
@@ -346,7 +355,12 @@ impl PgSession {
         shared.take_notices();
 
         let (commands, inbox) = mpsc::unbounded_channel();
-        tokio::spawn(serve(client, inbox, shared.clone(), params.clone()));
+        let actor = tokio::spawn(serve(client, inbox, shared.clone(), params.clone()));
+        shared
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(actor.abort_handle());
         Ok(Self {
             commands,
             shared,
@@ -951,10 +965,15 @@ impl Session for PgSession {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if let Some((token, tls)) = token {
-            let _ = match tls {
-                Some(tls) => token.cancel_query(tls).await,
-                None => token.cancel_query(NoTls).await,
+            // A cancel request is its own connection to the server; it must
+            // not be able to hang the caller if that cannot be made.
+            let request = async {
+                match tls {
+                    Some(tls) => token.cancel_query(tls).await,
+                    None => token.cancel_query(NoTls).await,
+                }
             };
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), request).await;
         }
     }
 
@@ -1501,6 +1520,20 @@ impl Session for PgSession {
 
     async fn close(&self) {
         let _ = self.commands.send(Command::Close);
+    }
+
+    async fn abandon(&self) {
+        // Dropping the tasks drops the socket; the server ends the statement
+        // when it notices the client is gone.
+        for task in self
+            .shared
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            task.abort();
+        }
     }
 }
 

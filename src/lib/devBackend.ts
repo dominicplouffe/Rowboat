@@ -333,7 +333,14 @@ async function fakeDatabase<T>(command: string, args: Record<string, unknown>): 
         for (let i = 0; i < 100 && !cancelled.has(queryId); i++) {
           await new Promise((r) => setTimeout(r, 50));
         }
-        if (cancelled.delete(queryId)) throw fail('cancelled', 'Query cancelled.');
+        if (cancelled.delete(queryId)) {
+          // "stuck" stands for a server that ignores cancel: the core closes the connection.
+          if (lower.includes('stuck')) {
+            open.delete(config.id);
+            throw fail('cancelled', 'Query cancelled.', { code: 'connection-closed' });
+          }
+          throw fail('cancelled', 'Query cancelled.');
+        }
       }
       if (lower.includes('lost_connection')) {
         // The server went away: the core's session is dead from here on.

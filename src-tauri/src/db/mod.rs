@@ -370,6 +370,13 @@ pub trait Session: Send + Sync {
     async fn export(&self, sql: &str, sink: Box<dyn RowSink>) -> DbResult<u64>;
 
     async fn close(&self);
+
+    /// Lets go of the connection at once, without waiting for the server:
+    /// for a statement that would not stop when cancelled. The session is
+    /// unusable afterwards.
+    async fn abandon(&self) {
+        self.close().await;
+    }
 }
 
 pub async fn connect(params: ConnectParams) -> DbResult<Box<dyn Session>> {

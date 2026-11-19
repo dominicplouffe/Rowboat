@@ -7,7 +7,7 @@ import { asDbError, ipc } from './ipc';
 import { schemaCache, changesSchema } from './schemaCache.svelte';
 import { settings } from './settings.svelte';
 import type { StatementRun, Tab } from './tabs.svelte';
-import type { DbKind, RunResult, StatementSpan } from './types';
+import type { DbError, DbKind, RunResult, StatementSpan } from './types';
 
 export type RunScope = 'statement' | 'script';
 
@@ -52,6 +52,14 @@ export function statementAtCursor(spans: StatementSpan[], cursor: number): State
 class Result {}
 function unproxied(result: RunResult): RunResult {
   return Object.assign(new Result(), result) as RunResult;
+}
+
+/**
+ * Whether the error means the core no longer has this connection: it broke, or
+ * a cancel the server ignored had to close it. The next run reconnects.
+ */
+function connectionGone(error: DbError): boolean {
+  return error.kind === 'connection' || error.code === 'connection-closed';
 }
 
 function newQueryId(): string {
@@ -127,7 +135,7 @@ export async function run(tab: Tab, selection: EditorSelection, scope: RunScope)
           }
           statement.error = error;
           statement.status = 'failed';
-          if (error.kind === 'connection') await connections.dropDead(connection.id);
+          if (connectionGone(error)) await connections.dropDead(connection.id);
           prompts.failed(tab, statement);
         }
         break;
@@ -202,7 +210,7 @@ async function refetch(
   } catch (e) {
     const error = asDbError(e);
     statement.note = error.kind === 'cancelled' ? 'Cancelled.' : error.message;
-    if (error.kind === 'connection') await connections.dropDead(connection.id);
+    if (connectionGone(error)) await connections.dropDead(connection.id);
   } finally {
     tab.queryId = null;
   }

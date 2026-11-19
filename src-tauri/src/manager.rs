@@ -422,19 +422,27 @@ impl Manager {
             .set_auto_commit(open.auto_commit.load(Ordering::SeqCst));
 
         let running = work(open.session.as_ref());
-        if timeout_secs == 0 {
-            return running.await;
-        }
-        match tokio::time::timeout(Duration::from_secs(timeout_secs as u64), running).await {
-            Ok(result) => result,
-            Err(_) => {
-                open.session.cancel().await;
-                Err(DbError::new(
-                    ErrorKind::Timeout,
-                    format!("The query was cancelled after the {timeout_secs} s timeout."),
-                )
-                .with_hint("Change the query timeout in Settings → Execution."))
+        let limited = async {
+            if timeout_secs == 0 {
+                return running.await;
             }
+            match tokio::time::timeout(Duration::from_secs(timeout_secs as u64), running).await {
+                Ok(result) => result,
+                Err(_) => {
+                    open.session.cancel().await;
+                    Err(DbError::new(
+                        ErrorKind::Timeout,
+                        format!("The query was cancelled after the {timeout_secs} s timeout."),
+                    )
+                    .with_hint("Change the query timeout in Settings → Execution."))
+                }
+            }
+        };
+        tokio::select! {
+            result = limited => result,
+            // `Manager::cancel` gave up waiting for the server and closed the
+            // connection: the user gets control back regardless.
+            () = wake.notified() => Err(abandoned()),
         }
     }
 
@@ -790,8 +798,32 @@ impl Manager {
             }
             entry.connection_id.clone()
         };
-        if let Ok(open) = self.session(&target).await {
-            open.session.cancel().await;
+        let Ok(open) = self.session(&target).await else {
+            return;
+        };
+        // Ask the server to stop, then give the statement a moment to end.
+        let _ = tokio::time::timeout(CANCEL_GRACE, open.session.cancel()).await;
+        let deadline = Instant::now() + CANCEL_GRACE;
+        while self.pending().contains_key(query_id) {
+            if Instant::now() >= deadline {
+                // The server did not stop it (a pooler that drops cancel
+                // requests, a stalled network…). Cancel must still work: close
+                // the connection and release the statement.
+                let mut sessions = self.sessions.lock().await;
+                if sessions
+                    .get(&target)
+                    .is_some_and(|current| Arc::ptr_eq(current, &open))
+                {
+                    sessions.remove(&target);
+                }
+                drop(sessions);
+                open.session.abandon().await;
+                if let Some(entry) = self.pending().get(query_id) {
+                    entry.wake.notify_one();
+                }
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
@@ -835,6 +867,21 @@ impl Drop for Finished<'_> {
     fn drop(&mut self) {
         self.0.pending().remove(self.1);
     }
+}
+
+/// How long a cancel waits for the server before closing the connection.
+const CANCEL_GRACE: Duration = Duration::from_millis(1500);
+
+/// The error code of a cancel that had to close the connection; the UI uses
+/// it to show the connection as closed.
+pub const CONNECTION_CLOSED: &str = "connection-closed";
+
+fn abandoned() -> DbError {
+    let mut error = DbError::cancelled().with_hint(
+        "The server did not stop the statement, so Rowboat closed the connection. It reconnects on the next run.",
+    );
+    error.code = Some(CONNECTION_CLOSED.into());
+    error
 }
 
 fn not_repeatable() -> DbError {
@@ -1687,5 +1734,111 @@ mod tests {
                 .unwrap()
                 .auto_commit
         );
+    }
+
+    /// A session whose statement never ends and whose server ignores cancel.
+    struct Stuck {
+        abandoned: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Session for Stuck {
+        fn kind(&self) -> DbKind {
+            DbKind::Postgres
+        }
+        fn server_version(&self) -> String {
+            String::new()
+        }
+        async fn execute(&self, _sql: &str, _options: ExecOptions) -> DbResult<QueryResult> {
+            std::future::pending().await
+        }
+        async fn cancel(&self) {
+            // The cancel request itself hangs too.
+            std::future::pending().await
+        }
+        async fn commit(&self) -> DbResult<()> {
+            Ok(())
+        }
+        async fn rollback(&self) -> DbResult<()> {
+            Ok(())
+        }
+        fn in_transaction(&self) -> bool {
+            false
+        }
+        fn supports_transactions(&self) -> bool {
+            true
+        }
+        fn set_auto_commit(&self, _auto_commit: bool) {}
+        async fn children(&self, _path: &[String]) -> DbResult<Vec<SchemaNode>> {
+            Ok(Vec::new())
+        }
+        async fn ddl(&self, _path: &[String]) -> DbResult<String> {
+            Ok(String::new())
+        }
+        async fn snapshot(&self) -> DbResult<SchemaSnapshot> {
+            Ok(SchemaSnapshot::default())
+        }
+        async fn export(&self, _sql: &str, _sink: Box<dyn db::RowSink>) -> DbResult<u64> {
+            Ok(0)
+        }
+        async fn close(&self) {}
+        async fn abandon(&self) {
+            self.abandoned.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_gives_control_back_even_when_the_server_never_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Arc::new(manager());
+        let settings = Settings::default();
+        let view = m
+            .save(sqlite(&dir, "stuck"), SecretInput::default())
+            .await
+            .unwrap();
+        let id = view.config.id.clone();
+        let abandoned = Arc::new(AtomicBool::new(false));
+        m.sessions.lock().await.insert(
+            id.clone(),
+            Arc::new(Open {
+                session: Box::new(Stuck {
+                    abandoned: abandoned.clone(),
+                }),
+                _tunnel: None,
+                config: view.config.clone(),
+                turn: tokio::sync::Mutex::new(()),
+                auto_commit: AtomicBool::new(true),
+            }),
+        );
+
+        let runner = m.clone();
+        let (run_id, run_settings) = (id.clone(), settings.clone());
+        let running = tokio::spawn(async move {
+            runner
+                .run(
+                    &run_id,
+                    "q1",
+                    "SELECT pg_sleep(600)",
+                    1000,
+                    true,
+                    &run_settings,
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let started = Instant::now();
+        m.cancel("q1").await;
+        let error = running.await.unwrap().unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(error.kind, ErrorKind::Cancelled);
+        assert_eq!(error.code.as_deref(), Some(CONNECTION_CLOSED));
+        // The stuck connection is gone, so the next run opens a fresh one.
+        assert!(abandoned.load(Ordering::SeqCst));
+        assert!(!m.is_open(&id).await);
     }
 }
