@@ -22,8 +22,9 @@ it. These are still open:
    ```
 
 2. **Try the copilot with real providers.** The acceptance criteria name
-   OpenAI, Anthropic, Gemini, DeepSeek and Ollama. Development could only test
-   against a fake server speaking each documented format.
+   OpenAI, Anthropic, Gemini, DeepSeek and Ollama. Anthropic works for real;
+   the others have only been tested against a fake server speaking each
+   documented format.
 3. **Walk through [ACCEPTANCE.md](ACCEPTANCE.md)** on macOS, Windows and
    Ubuntu.
 
