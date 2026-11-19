@@ -235,6 +235,13 @@ impl AppDb {
              CREATE TABLE IF NOT EXISTS session (
                  key   TEXT PRIMARY KEY,
                  value TEXT NOT NULL
+             );
+             -- Whether a keychain entry exists, never what it holds. Lets the
+             -- UI show a secret as saved without reading the keychain
+             -- (see Manager::has_secret).
+             CREATE TABLE IF NOT EXISTS secret_presence (
+                 account TEXT PRIMARY KEY,
+                 present INTEGER NOT NULL
              );",
         )
         .map_err(db_err)?;
@@ -413,6 +420,40 @@ impl AppDb {
     pub fn session_delete(&self, key: &str) -> Result<()> {
         self.lock()
             .execute("DELETE FROM session WHERE key = ?1", params![key])
+            .map(|_| ())
+            .map_err(db_err)
+    }
+
+    /// Whether the keychain holds `account`, if Rowboat has recorded it.
+    pub fn secret_presence(&self, account: &str) -> Result<Option<bool>> {
+        use rusqlite::OptionalExtension;
+        self.lock()
+            .query_row(
+                "SELECT present FROM secret_presence WHERE account = ?1",
+                params![account],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)
+    }
+
+    pub fn set_secret_presence(&self, account: &str, present: bool) -> Result<()> {
+        self.lock()
+            .execute(
+                "INSERT INTO secret_presence (account, present) VALUES (?1, ?2)
+                 ON CONFLICT(account) DO UPDATE SET present = excluded.present",
+                params![account, present],
+            )
+            .map(|_| ())
+            .map_err(db_err)
+    }
+
+    pub fn forget_secret_presence(&self, account: &str) -> Result<()> {
+        self.lock()
+            .execute(
+                "DELETE FROM secret_presence WHERE account = ?1",
+                params![account],
+            )
             .map(|_| ())
             .map_err(db_err)
     }

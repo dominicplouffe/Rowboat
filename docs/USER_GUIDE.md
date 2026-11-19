@@ -41,6 +41,10 @@ Passwords and passphrases are stored in your operating system's keychain. If
 the system has none (some Linux setups), Rowboat says so in the status bar and
 keeps them in memory until you quit.
 
+Rowboat reads a saved password only when you connect, and an API key only when
+you send a request. On macOS the first read may ask for your login password;
+choose **Always Allow** so it does not ask again.
+
 ## Writing and running SQL
 
 | Action                                               | Shortcut            |

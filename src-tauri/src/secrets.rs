@@ -149,7 +149,7 @@ impl Secrets {
         self.chosen.get_or_init(self.probe).1
     }
 
-    fn account(connection_id: &str, kind: SecretKind) -> String {
+    pub(crate) fn account(connection_id: &str, kind: SecretKind) -> String {
         format!("connection/{connection_id}/{}", kind.slug())
     }
 
@@ -167,11 +167,12 @@ impl Secrets {
         }
     }
 
+    #[cfg(test)]
     pub fn has(&self, connection_id: &str, kind: SecretKind) -> bool {
         matches!(self.get(connection_id, kind), Ok(Some(_)))
     }
 
-    fn ai_account(provider_id: &str) -> String {
+    pub(crate) fn ai_account(provider_id: &str) -> String {
         format!("ai/{provider_id}/key")
     }
 
