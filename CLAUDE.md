@@ -23,8 +23,8 @@ Built milestone by milestone (spec → "Milestones"), one branch and one PR each
     headroom. Anything added to the startup path must be lazy.
 - [x] **M3 AI copilot** — three provider adapters, schema index, Ask / Fix / Explain, AI settings,
       first-launch wizard, sample database
-  - No real AI provider has been called: the build environment cannot reach them. The adapters
-    are tested against a local fake server that speaks each documented wire format.
+  - Anthropic works for real (Ask, Fix and Explain, on macOS). The other adapters have only
+    been tested against a local fake server that speaks each documented wire format.
 - [x] **M4 Release** — update notice, grid budget test, user guide, signing and release docs,
       acceptance status
   - **v0.1 is not tagged.** The release gate is "every CI budget green". What is left is in `docs/RELEASING.md`; where each acceptance criterion stands is in
