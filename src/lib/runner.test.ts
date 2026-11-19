@@ -226,4 +226,20 @@ describe('running statements', () => {
     await fetchNextPage(tab);
     expect(tab.runs[0].result!.rows).toHaveLength(200);
   });
+
+  it('a cancel that had to close the connection shows it as closed, and the next run reconnects', async () => {
+    const { cancel } = await import('./runner');
+    tab.text = 'select sleep_stuck()';
+    const running = run(tab, cursor(0), 'statement');
+    await expect.poll(() => tab.queryId).not.toBeNull();
+    await cancel(tab);
+    await running;
+    expect(tab.runs[0].error?.kind).toBe('cancelled');
+    expect(connections.byId(tab.connectionId)?.connected).toBe(false);
+
+    tab.text = 'select 1';
+    await run(tab, cursor(0), 'statement');
+    expect(tab.runs[0].status).toBe('done');
+    expect(connections.byId(tab.connectionId)?.connected).toBe(true);
+  });
 });

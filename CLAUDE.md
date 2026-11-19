@@ -168,6 +168,11 @@ in a single transaction (a savepoint when the user already has one open).
 Driver rules: values leave the driver already rendered as text; the row limit
 is enforced while fetching (portal with a row count / `max_result_rows` and a
 client-side cut / stop stepping); cancel must return within a second.
+`Manager::cancel` enforces the last one whatever the server does: it asks the
+driver to cancel, waits a short grace period, and if the statement is still
+running it closes the connection (`Session::abandon`) and releases the caller
+with a `cancelled` error whose code is `connection-closed`. The UI then shows
+the connection as closed and the next run reconnects.
 
 How an AI request flows: the UI calls `ai_run` with a task (ask / fix /
 explain) and a Tauri channel → `Copilot::run` picks the provider in use, reads
