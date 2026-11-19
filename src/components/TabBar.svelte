@@ -1,5 +1,6 @@
 <script lang="ts">
   import { ACTIONS } from '../lib/actions';
+  import { connections } from '../lib/connections.svelte';
   import { settings } from '../lib/settings.svelte';
   import { chordFor, formatChord } from '../lib/shortcuts';
   import { tabs } from '../lib/tabs.svelte';
@@ -13,6 +14,12 @@
         settings.value?.keyboard.overrides ?? {},
       ),
     );
+  /** The tab's connection colour: Prod is always the danger colour, as in the sidebar. */
+  function colorOf(connectionId: string | null): string | null {
+    const connection = connections.byId(connectionId);
+    if (!connection) return null;
+    return connection.environment === 'prod' ? 'var(--danger)' : connection.color || null;
+  }
   const run = (id: string) => ACTIONS.find((a) => a.id === id)!.run();
 </script>
 
@@ -29,15 +36,24 @@
 
   <div class="tabs" role="tablist" aria-label="Query tabs">
     {#each tabs.list as tab (tab.id)}
-      <div class="tab" class:active={tab.id === tabs.activeId}>
+      {@const color = colorOf(tab.connectionId)}
+      {@const connection = connections.byId(tab.connectionId)}
+      <div
+        class="tab"
+        class:active={tab.id === tabs.activeId}
+        class:colored={!!color}
+        style:--tab-color={color}
+      >
         <button
           class="label"
           role="tab"
           aria-selected={tab.id === tabs.activeId}
           onclick={() => (tabs.activeId = tab.id)}
           onauxclick={(e) => e.button === 1 && tabs.close(tab.id)}
+          title={connection ? `${tab.title} — ${connection.name}` : tab.title}
         >
-          {tab.title}{tab.path && tab.savedText !== tab.text ? ' •' : ''}
+          {#if color}<span class="dot" aria-hidden="true"></span>{/if}
+          <span class="title">{tab.title}{tab.path && tab.savedText !== tab.text ? ' •' : ''}</span>
         </button>
         <button
           class="close"
@@ -102,7 +118,22 @@
     margin-bottom: -1px;
     padding-bottom: 1px;
   }
+  /* The connection's colour: a stripe along the top and a dot by the title. */
+  .tab.colored {
+    box-shadow: inset 0 2px 0 var(--tab-color);
+  }
+  .dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    margin-right: 6px;
+    border-radius: 50%;
+    background: var(--tab-color);
+    flex: none;
+  }
   .label {
+    display: flex;
+    align-items: center;
     height: 100%;
     padding: 0 4px 0 12px;
     border: none;
@@ -110,6 +141,10 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .title {
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .close {
     display: grid;
